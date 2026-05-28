@@ -9,6 +9,9 @@ from durable_evals.step import DurableStepInProgress, step
 class Runtime:
     def __init__(self, outcome=None):
         self.outcome = outcome or {"type": "execute", "attempt": 1}
+        self.async_began = False
+        self.async_completed = False
+        self.async_failed = False
         self.completed = []
         self.failed = []
 
@@ -20,6 +23,19 @@ class Runtime:
         self.completed.append(payload)
 
     def fail_step(self, payload):
+        self.failed.append(payload)
+
+    async def abegin_step(self, payload):
+        self.async_began = True
+        self.began = payload
+        return self.outcome
+
+    async def acomplete_step(self, payload):
+        self.async_completed = True
+        self.completed.append(payload)
+
+    async def afail_step(self, payload):
+        self.async_failed = True
         self.failed.append(payload)
 
 
@@ -54,6 +70,8 @@ def test_async_step_remains_async():
     assert inspect.isawaitable(result)
 
     assert asyncio.run(result) == {"value": 1}
+    assert eval._runtime.async_began is True
+    assert eval._runtime.async_completed is True
     assert eval._runtime.completed[0]["output"] == {"value": 1}
 
 
@@ -62,6 +80,20 @@ def test_in_progress_raises_for_sync_step():
 
     with pytest.raises(DurableStepInProgress):
         eval.sync_step(1)
+
+
+def test_sync_step_returns_cached_output():
+    eval = Eval(Runtime({"type": "skip_completed", "output": {"value": "cached"}}))
+
+    assert eval.sync_step(1) == {"value": "cached"}
+    assert eval._runtime.completed == []
+
+
+def test_async_step_returns_cached_output():
+    eval = Eval(Runtime({"type": "skip_completed", "output": {"value": "cached"}}))
+
+    assert asyncio.run(eval.async_step(1)) == {"value": "cached"}
+    assert eval._runtime.completed == []
 
 
 def test_sync_step_rejects_awaitable_result():

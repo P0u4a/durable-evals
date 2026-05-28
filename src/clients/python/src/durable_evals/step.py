@@ -7,6 +7,7 @@ import json
 from typing import Any, Callable, TypeVar
 
 F = TypeVar("F", bound=Callable[..., Any])
+BeginResult = tuple[str, str, str] | tuple[str, Any]
 
 
 class DurableStepFailed(RuntimeError):
@@ -18,7 +19,7 @@ class DurableStepInProgress(RuntimeError):
 
 
 def step(fn: F) -> F:
-    def begin(self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[str, str]:
+    def begin(self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> BeginResult:
         step_name = f"{fn.__module__}.{fn.__qualname__}"
         input_digest = input_digest_for(step_name, args, kwargs)
 
@@ -29,12 +30,11 @@ def step(fn: F) -> F:
                 "input_digest": input_digest,
             }
         )
-        handle_outcome(step_name, outcome)
-        return step_name, input_digest
+        return handle_outcome(step_name, input_digest, outcome)
 
     async def abegin(
         self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> tuple[str, str]:
+    ) -> BeginResult:
         step_name = f"{fn.__module__}.{fn.__qualname__}"
         input_digest = input_digest_for(step_name, args, kwargs)
 
@@ -45,8 +45,7 @@ def step(fn: F) -> F:
                 "input_digest": input_digest,
             }
         )
-        handle_outcome(step_name, outcome)
-        return step_name, input_digest
+        return handle_outcome(step_name, input_digest, outcome)
 
     def input_digest_for(
         step_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -57,17 +56,19 @@ def step(fn: F) -> F:
             raise ValueError(f"step input for {step_name} must be JSON-serializable") from exc
         return hashlib.sha256(input_json.encode("utf-8")).hexdigest()
 
-    def handle_outcome(step_name: str, outcome: dict[str, Any]) -> None:
+    def handle_outcome(
+        step_name: str, input_digest: str, outcome: dict[str, Any]
+    ) -> BeginResult:
         match outcome["type"]:
             case "skip_completed":
-                return outcome["output"]
+                return "skip", outcome["output"]
             case "failed_terminal":
                 error = outcome["error"]
                 raise DurableStepFailed(f"{error['error_type']}: {error['message']}")
             case "in_progress":
                 raise DurableStepInProgress(f"step is already running: {step_name}")
             case "execute":
-                pass
+                return "execute", step_name, input_digest
             case other:
                 raise RuntimeError(f"unexpected step outcome: {other}")
 
@@ -133,7 +134,10 @@ def step(fn: F) -> F:
 
     @functools.wraps(fn)
     async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        step_name, input_digest = await abegin(self, args, kwargs)
+        begin_result = await abegin(self, args, kwargs)
+        if begin_result[0] == "skip":
+            return begin_result[1]
+        _, step_name, input_digest = begin_result
 
         try:
             result = fn(self, *args, **kwargs)
@@ -148,7 +152,10 @@ def step(fn: F) -> F:
 
     @functools.wraps(fn)
     def sync_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        step_name, input_digest = begin(self, args, kwargs)
+        begin_result = begin(self, args, kwargs)
+        if begin_result[0] == "skip":
+            return begin_result[1]
+        _, step_name, input_digest = begin_result
 
         try:
             result = fn(self, *args, **kwargs)
