@@ -32,8 +32,8 @@ import { DurableEval } from "durable-evals";
 
 const myEval = new DurableEval();
 
-const fetchCases = myEval.addStep("fetchCases", async () => [{ id: "case-1" }]);
-const runAgent = myEval.addStep("runAgent", async (testCase) => ({
+const fetchCases = myEval.step("fetchCases", async () => [{ id: "case-1" }]);
+const runAgent = myEval.step("runAgent", async (testCase) => ({
   case_id: testCase.id,
   answer: "ok",
 }));

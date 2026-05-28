@@ -39,7 +39,7 @@ test("returns a durable callback that completes a step", async () => {
   const runtime = new Runtime();
   const evalRun = new DurableEval({ runId: "run", runtime });
 
-  const runAgent = evalRun.addStep(
+  const runAgent = evalRun.step(
     "runAgent",
     async (testCase: { id: string }) => ({
       caseId: testCase.id,
@@ -63,7 +63,7 @@ test("returns cached output without calling callback", async () => {
   });
   const evalRun = new DurableEval({ runId: "run", runtime });
 
-  const cached = evalRun.addStep("cached", (_input: string) => {
+  const cached = evalRun.step("cached", (_input: string) => {
     throw new Error("should not run");
   });
 
@@ -74,7 +74,7 @@ test("returns cached output without calling callback", async () => {
 test("raises for in-progress steps", async () => {
   const runtime = new Runtime({ type: "in_progress" });
   const evalRun = new DurableEval({ runId: "run", runtime });
-  const busy = evalRun.addStep("busy", () => ({ ok: true }));
+  const busy = evalRun.step("busy", () => ({ ok: true }));
 
   await assert.rejects(busy(), DurableStepInProgress);
 });
@@ -85,7 +85,7 @@ test("raises terminal failures", async () => {
     error: { error_type: "ValueError", message: "bad input" },
   });
   const evalRun = new DurableEval({ runId: "run", runtime });
-  const failed = evalRun.addStep("failed", () => ({ ok: true }));
+  const failed = evalRun.step("failed", () => ({ ok: true }));
 
   await assert.rejects(failed(), DurableStepFailed);
 });
@@ -93,7 +93,7 @@ test("raises terminal failures", async () => {
 test("records callback failures", async () => {
   const runtime = new Runtime();
   const evalRun = new DurableEval({ runId: "run", runtime });
-  const explode = evalRun.addStep("explode", () => {
+  const explode = evalRun.step("explode", () => {
     throw new TypeError("boom");
   });
 
@@ -108,10 +108,10 @@ test("records callback failures", async () => {
 test("supports user-owned orchestration", async () => {
   const runtime = new Runtime();
   const evalRun = new DurableEval({ runId: "run", runtime });
-  const fetchCases = evalRun.addStep("fetchCases", async () => [
+  const fetchCases = evalRun.step("fetchCases", async () => [
     { id: "case-1" },
   ]);
-  const runAgent = evalRun.addStep(
+  const runAgent = evalRun.step(
     "runAgent",
     async (testCase: { id: string }) => ({
       caseId: testCase.id,

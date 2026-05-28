@@ -27,21 +27,21 @@ export class DurableEval {
     this.runtime = options.runtime ?? null;
   }
 
-  addStep<TArgs extends unknown[], TOutput>(
+  step<TArgs extends unknown[], TOutput>(
     callback: StepCallback<TArgs, TOutput>,
   ): DurableStep<TArgs, TOutput>;
-  addStep<TArgs extends unknown[], TOutput>(
+  step<TArgs extends unknown[], TOutput>(
     name: string,
     callback: StepCallback<TArgs, TOutput>,
   ): DurableStep<TArgs, TOutput>;
-  addStep<TArgs extends unknown[], TOutput>(
+  step<TArgs extends unknown[], TOutput>(
     nameOrCallback: string | StepCallback<TArgs, TOutput>,
     maybeCallback?: StepCallback<TArgs, TOutput>,
   ): DurableStep<TArgs, TOutput> {
     const name = typeof nameOrCallback === "string" ? nameOrCallback : null;
     const callback = typeof nameOrCallback === "function" ? nameOrCallback : maybeCallback;
     if (typeof callback !== "function") {
-      throw new TypeError("addStep expects a callback or a name and callback");
+      throw new TypeError("step expects a callback or a name and callback");
     }
 
     const stepName = (name ?? callback.name) || "anonymous";
