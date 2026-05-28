@@ -5,8 +5,8 @@ use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use durable_evals_core::{
-    BeginStepRequest, CompleteStepRequest, ErrorInfo, FailStepRequest, Health, Runtime,
-    SqliteStore, StepOutcome,
+    BeginStepRequest, CompleteStepRequest, Error as StoreError, ErrorInfo, FailStepRequest, Health,
+    Runtime, SqliteStore, StepOutcome,
 };
 
 #[tokio::main]
@@ -45,10 +45,7 @@ async fn begin_step(
     State(runtime): State<Runtime>,
     Json(req): Json<BeginStepRequest>,
 ) -> Result<Json<StepOutcome>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime
-        .begin_step(req)
-        .map(Json)
-        .map_err(internal_server_error)
+    runtime.begin_step(req).map(Json).map_err(store_error)
 }
 
 async fn complete_step(
@@ -58,7 +55,7 @@ async fn complete_step(
     runtime
         .complete_step(req)
         .map(|_| Json(Health { ok: true }))
-        .map_err(internal_server_error)
+        .map_err(store_error)
 }
 
 async fn fail_step(
@@ -68,7 +65,7 @@ async fn fail_step(
     runtime
         .fail_step(req)
         .map(|_| Json(Health { ok: true }))
-        .map_err(internal_server_error)
+        .map_err(store_error)
 }
 
 fn internal_server_error<E: std::fmt::Display>(
@@ -81,4 +78,17 @@ fn internal_server_error<E: std::fmt::Display>(
             message: error.to_string(),
         }),
     )
+}
+
+fn store_error(error: StoreError) -> (axum::http::StatusCode, Json<ErrorInfo>) {
+    match error {
+        StoreError::StepNotFound => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(ErrorInfo {
+                error_type: "StepNotFound".to_string(),
+                message: error.to_string(),
+            }),
+        ),
+        error => internal_server_error(error),
+    }
 }
