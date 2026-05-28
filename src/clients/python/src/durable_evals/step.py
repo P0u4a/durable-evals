@@ -13,11 +13,18 @@ class DurableStepFailed(RuntimeError):
     pass
 
 
+class DurableStepInProgress(RuntimeError):
+    pass
+
+
 def step(fn: F) -> F:
     @functools.wraps(fn)
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         step_name = f"{fn.__module__}.{fn.__qualname__}"
-        input_json = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True)
+        try:
+            input_json = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True)
+        except TypeError as exc:
+            raise ValueError(f"step input for {step_name} must be JSON-serializable") from exc
         input_digest = hashlib.sha256(input_json.encode("utf-8")).hexdigest()
 
         outcome = self._runtime.begin_step(
@@ -34,6 +41,8 @@ def step(fn: F) -> F:
             case "failed_terminal":
                 error = outcome["error"]
                 raise DurableStepFailed(f"{error['error_type']}: {error['message']}")
+            case "in_progress":
+                raise DurableStepInProgress(f"step is already running: {step_name}")
             case "execute":
                 pass
             case other:
@@ -56,6 +65,11 @@ def step(fn: F) -> F:
                 }
             )
             raise
+
+        try:
+            json.dumps(result)
+        except TypeError as exc:
+            raise ValueError(f"step output for {step_name} must be JSON-serializable") from exc
 
         self._runtime.complete_step(
             {
