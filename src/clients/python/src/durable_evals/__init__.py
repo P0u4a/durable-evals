@@ -1,4 +1,4 @@
-from .eval import DurableEval, Eval
+from .eval import DurableEval
 from .step import DurableStepFailed, DurableStepInProgress, step
 
-__all__ = ["DurableEval", "DurableStepFailed", "DurableStepInProgress", "Eval", "step"]
+__all__ = ["DurableEval", "DurableStepFailed", "DurableStepInProgress", "step"]
