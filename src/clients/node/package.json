@@ -1,0 +1,32 @@
+{
+  "name": "durable-evals",
+  "version": "0.1.0",
+  "description": "NodeJS client for durable evals.",
+  "type": "module",
+  "packageManager": "pnpm@10.20.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "pnpm run build && pnpm run typecheck && node --test tests/*.test.ts",
+    "prepack": "pnpm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.4",
+    "typescript": "^5.9.0"
+  }
+}

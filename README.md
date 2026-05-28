@@ -4,28 +4,43 @@ A durable eval harness for performing long-running evals on agents, recovering g
 
 ## Python Client
 
-An `Eval` base class plus `@step` decorator. The decorator
-records function start/end with a hidden local Rust server, so user code only needs
-to annotate durable boundaries.
-
 ```python
-from durable_evals import Eval, step
+from durable_evals import DurableEval, step
 
 
-class MyEval(Eval):
+class MyEval(DurableEval):
     @step
     async def fetch_cases(self):
         return [{"id": "case-1"}]
 
     @step
-    async def run_agent(self, cases):
-        return [{"case_id": case["id"], "answer": "ok"} for case in cases]
+    async def run_agent(self, test_case):
+        return {"case_id": test_case["id"], "answer": "ok"}
 
     async def run(self):
         cases = await self.fetch_cases()
-        return await self.run_agent(cases)
+        results = []
+        for case in cases:
+            results.append(await self.run_agent(case))
+        return results
 ```
 
-## TypeScript (NodeJS) Client
+## Node Client
 
-todo
+```js
+import { DurableEval } from "durable-evals";
+
+const myEval = new DurableEval();
+
+const fetchCases = myEval.addStep("fetchCases", async () => [{ id: "case-1" }]);
+const runAgent = myEval.addStep("runAgent", async (testCase) => ({
+  case_id: testCase.id,
+  answer: "ok",
+}));
+
+const cases = await fetchCases();
+const results = [];
+for await (const result of cases.map((testCase) => runAgent(testCase))) {
+  results.push(result);
+}
+```
