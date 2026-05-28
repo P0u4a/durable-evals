@@ -20,11 +20,7 @@ class DurableStepInProgress(RuntimeError):
 def step(fn: F) -> F:
     def begin(self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[str, str]:
         step_name = f"{fn.__module__}.{fn.__qualname__}"
-        try:
-            input_json = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True)
-        except TypeError as exc:
-            raise ValueError(f"step input for {step_name} must be JSON-serializable") from exc
-        input_digest = hashlib.sha256(input_json.encode("utf-8")).hexdigest()
+        input_digest = input_digest_for(step_name, args, kwargs)
 
         outcome = self._runtime.begin_step(
             {
@@ -33,7 +29,35 @@ def step(fn: F) -> F:
                 "input_digest": input_digest,
             }
         )
+        handle_outcome(step_name, outcome)
+        return step_name, input_digest
 
+    async def abegin(
+        self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[str, str]:
+        step_name = f"{fn.__module__}.{fn.__qualname__}"
+        input_digest = input_digest_for(step_name, args, kwargs)
+
+        outcome = await self._runtime.abegin_step(
+            {
+                "run_id": self.run_id,
+                "step_name": step_name,
+                "input_digest": input_digest,
+            }
+        )
+        handle_outcome(step_name, outcome)
+        return step_name, input_digest
+
+    def input_digest_for(
+        step_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> str:
+        try:
+            input_json = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True)
+        except TypeError as exc:
+            raise ValueError(f"step input for {step_name} must be JSON-serializable") from exc
+        return hashlib.sha256(input_json.encode("utf-8")).hexdigest()
+
+    def handle_outcome(step_name: str, outcome: dict[str, Any]) -> None:
         match outcome["type"]:
             case "skip_completed":
                 return outcome["output"]
@@ -47,8 +71,6 @@ def step(fn: F) -> F:
             case other:
                 raise RuntimeError(f"unexpected step outcome: {other}")
 
-        return step_name, input_digest
-
     def complete(self: Any, step_name: str, input_digest: str, result: Any) -> None:
         try:
             json.dumps(result)
@@ -56,6 +78,23 @@ def step(fn: F) -> F:
             raise ValueError(f"step output for {step_name} must be JSON-serializable") from exc
 
         self._runtime.complete_step(
+            {
+                "run_id": self.run_id,
+                "step_name": step_name,
+                "input_digest": input_digest,
+                "output": result,
+            }
+        )
+
+    async def acomplete(
+        self: Any, step_name: str, input_digest: str, result: Any
+    ) -> None:
+        try:
+            json.dumps(result)
+        except TypeError as exc:
+            raise ValueError(f"step output for {step_name} must be JSON-serializable") from exc
+
+        await self._runtime.acomplete_step(
             {
                 "run_id": self.run_id,
                 "step_name": step_name,
@@ -77,19 +116,34 @@ def step(fn: F) -> F:
             }
         )
 
+    async def afail(
+        self: Any, step_name: str, input_digest: str, exc: Exception
+    ) -> None:
+        await self._runtime.afail_step(
+            {
+                "run_id": self.run_id,
+                "step_name": step_name,
+                "input_digest": input_digest,
+                "error": {
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }
+        )
+
     @functools.wraps(fn)
     async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        step_name, input_digest = begin(self, args, kwargs)
+        step_name, input_digest = await abegin(self, args, kwargs)
 
         try:
             result = fn(self, *args, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
-            fail(self, step_name, input_digest, exc)
+            await afail(self, step_name, input_digest, exc)
             raise
 
-        complete(self, step_name, input_digest, result)
+        await acomplete(self, step_name, input_digest, result)
         return result
 
     @functools.wraps(fn)

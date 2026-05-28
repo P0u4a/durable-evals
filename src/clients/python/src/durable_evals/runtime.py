@@ -13,6 +13,7 @@ import httpx
 class RuntimeClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
+        self._async_client: httpx.AsyncClient | None = None
 
     @classmethod
     def ensure_started(cls, storage_dir: Path) -> "RuntimeClient":
@@ -74,7 +75,30 @@ class RuntimeClient:
     def fail_step(self, payload: dict[str, Any]) -> None:
         self._post("/steps/fail", payload)
 
+    async def abegin_step(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._apost("/steps/begin", payload)
+
+    async def acomplete_step(self, payload: dict[str, Any]) -> None:
+        await self._apost("/steps/complete", payload)
+
+    async def afail_step(self, payload: dict[str, Any]) -> None:
+        await self._apost("/steps/fail", payload)
+
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = httpx.post(f"{self.base_url}{path}", json=payload, timeout=30)
         response.raise_for_status()
         return response.json()
+
+    async def _apost(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await self._async_http().post(path, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def _async_http(self) -> httpx.AsyncClient:
+        if self._async_client is None or self._async_client.is_closed:
+            self._async_client = httpx.AsyncClient(base_url=self.base_url, timeout=30)
+        return self._async_client
+
+    async def aclose(self) -> None:
+        if self._async_client is not None:
+            await self._async_client.aclose()
