@@ -103,6 +103,8 @@ def step(fn: F) -> F:
             raise
 
         if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
+                result.close()
             raise TypeError(f"sync step returned an awaitable: {step_name}")
 
         complete(self, step_name, input_digest, result)
