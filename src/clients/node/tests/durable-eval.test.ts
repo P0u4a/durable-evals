@@ -16,6 +16,7 @@ class Runtime implements DurableRuntime {
   began: Payload[] = [];
   completed: Payload[] = [];
   failed: Payload[] = [];
+  completeError: Error | null = null;
 
   constructor(outcome: StepOutcome = { type: "execute", attempt: 1 }) {
     this.outcome = outcome;
@@ -27,6 +28,9 @@ class Runtime implements DurableRuntime {
   }
 
   async completeStep(payload: Payload): Promise<void> {
+    if (this.completeError !== null) {
+      throw this.completeError;
+    }
     this.completed.push(payload);
   }
 
@@ -103,6 +107,32 @@ test("records callback failures", async () => {
     error_type: "TypeError",
     message: "boom",
   });
+});
+
+test("does not record output serialization failures as step failures", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  const badOutput = evalRun.step("badOutput", () => ({
+    value: BigInt(1),
+  }));
+
+  await assert.rejects(
+    badOutput(),
+    /step output for badOutput must be JSON-serializable/,
+  );
+  assert.equal(runtime.failed.length, 0);
+  assert.equal(runtime.completed.length, 0);
+});
+
+test("does not record completion failures as step failures", async () => {
+  const runtime = new Runtime();
+  runtime.completeError = new Error("completion failed");
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  const step = evalRun.step("completeFails", () => ({ ok: true }));
+
+  await assert.rejects(step(), /completion failed/);
+  assert.equal(runtime.failed.length, 0);
+  assert.equal(runtime.completed.length, 0);
 });
 
 test("supports user-owned orchestration", async () => {

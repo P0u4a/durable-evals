@@ -77,16 +77,9 @@ export class DurableEval {
       throw new Error(`unexpected step outcome: ${(outcome as { type?: string }).type}`);
     }
 
+    let result: TOutput;
     try {
-      const result = await callback(...args);
-      assertJsonSerializable(result, `step output for ${stepName}`);
-      await runtime.completeStep({
-        run_id: this.runId,
-        step_name: stepName,
-        input_digest: inputDigest,
-        output: result,
-      });
-      return result as Awaited<TOutput>;
+      result = await callback(...args);
     } catch (error) {
       await runtime.failStep({
         run_id: this.runId,
@@ -99,6 +92,15 @@ export class DurableEval {
       });
       throw error;
     }
+
+    assertJsonSerializable(result, `step output for ${stepName}`);
+    await runtime.completeStep({
+      run_id: this.runId,
+      step_name: stepName,
+      input_digest: inputDigest,
+      output: result,
+    });
+    return result as Awaited<TOutput>;
   }
 
   private async getRuntime(): Promise<Runtime> {
