@@ -4,6 +4,4 @@ mod types;
 
 pub use runtime::Runtime;
 pub use sqlite::{Error, SqliteStore};
-pub use types::{
-    BeginStepRequest, CompleteStepRequest, ErrorInfo, FailStepRequest, Health, StepOutcome,
-};
+pub use types::*;
