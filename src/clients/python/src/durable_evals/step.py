@@ -18,9 +18,12 @@ class DurableStepInProgress(RuntimeError):
     pass
 
 
-def step(fn: F) -> F:
+def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] | None = None) -> F:
+    if fn is None:
+        return lambda wrapped: step(wrapped, name=name, retry=retry)  # type: ignore[return-value]
+
     def begin(self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> BeginResult:
-        step_name = f"{fn.__module__}.{fn.__qualname__}"
+        step_name = name or f"{fn.__module__}.{fn.__qualname__}"
         input_digest = input_digest_for(step_name, args, kwargs)
 
         outcome = self._runtime.begin_step(
@@ -28,6 +31,7 @@ def step(fn: F) -> F:
                 "run_id": self.run_id,
                 "step_name": step_name,
                 "input_digest": input_digest,
+                "retry": retry or {},
             }
         )
         return handle_outcome(step_name, input_digest, outcome)
@@ -35,7 +39,7 @@ def step(fn: F) -> F:
     async def abegin(
         self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> BeginResult:
-        step_name = f"{fn.__module__}.{fn.__qualname__}"
+        step_name = name or f"{fn.__module__}.{fn.__qualname__}"
         input_digest = input_digest_for(step_name, args, kwargs)
 
         outcome = await self._runtime.abegin_step(
@@ -43,6 +47,7 @@ def step(fn: F) -> F:
                 "run_id": self.run_id,
                 "step_name": step_name,
                 "input_digest": input_digest,
+                "retry": retry or {},
             }
         )
         return handle_outcome(step_name, input_digest, outcome)
@@ -65,6 +70,8 @@ def step(fn: F) -> F:
             case "failed_terminal":
                 error = outcome["error"]
                 raise DurableStepFailed(f"{error['error_type']}: {error['message']}")
+            case "retry_later":
+                raise DurableStepInProgress(f"step retry is scheduled at {outcome['retry_at']}: {step_name}")
             case "in_progress":
                 raise DurableStepInProgress(f"step is already running: {step_name}")
             case "execute":
@@ -113,6 +120,8 @@ def step(fn: F) -> F:
                 "error": {
                     "error_type": type(exc).__name__,
                     "message": str(exc),
+                    "failure_class": "user_code_error",
+                    "retryable": True,
                 },
             }
         )
@@ -128,6 +137,8 @@ def step(fn: F) -> F:
                 "error": {
                     "error_type": type(exc).__name__,
                     "message": str(exc),
+                    "failure_class": "user_code_error",
+                    "retryable": True,
                 },
             }
         )

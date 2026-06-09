@@ -75,6 +75,42 @@ class RuntimeClient:
     def fail_step(self, payload: dict[str, Any]) -> None:
         self._post("/steps/fail", payload)
 
+    def heartbeat_step(self, payload: dict[str, Any]) -> None:
+        self._post("/steps/heartbeat", payload)
+
+    def register_run(self, payload: dict[str, Any]) -> None:
+        self._post("/runs/register", payload)
+
+    def summary(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/runs/summary", payload)
+
+    def export(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/runs/export", payload)
+
+    def register_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/batches/register", payload)
+
+    def list_cases(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._post("/batches/cases/list", payload)
+
+    def complete_case(self, payload: dict[str, Any]) -> None:
+        self._post("/batches/cases/complete", payload)
+
+    def fail_case(self, payload: dict[str, Any]) -> None:
+        self._post("/batches/cases/fail", payload)
+
+    def register_variants(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._post("/variants/register", payload)
+
+    def register_worker(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/workers/register", payload)
+
+    def trace_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/traces/events", payload)
+
+    def mark_reviewed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/reviews", payload)
+
     async def abegin_step(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._apost("/steps/begin", payload)
 
@@ -83,6 +119,15 @@ class RuntimeClient:
 
     async def afail_step(self, payload: dict[str, Any]) -> None:
         await self._apost("/steps/fail", payload)
+
+    async def aregister_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._apost("/batches/register", payload)
+
+    async def acomplete_case(self, payload: dict[str, Any]) -> None:
+        await self._apost("/batches/cases/complete", payload)
+
+    async def afail_case(self, payload: dict[str, Any]) -> None:
+        await self._apost("/batches/cases/fail", payload)
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = httpx.post(f"{self.base_url}{path}", json=payload, timeout=30)
