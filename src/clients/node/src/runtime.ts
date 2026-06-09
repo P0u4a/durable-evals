@@ -8,12 +8,24 @@ export type StepOutcome =
   | { type: "execute"; attempt: number }
   | { type: "skip_completed"; output: unknown }
   | { type: "in_progress" }
-  | { type: "failed_terminal"; error: { error_type: string; message: string } };
+  | { type: "failed_terminal"; error: { error_type: string; message: string } }
+  | { type: "retry_later"; retry_at: string };
 
 export interface Runtime {
   beginStep(payload: Record<string, unknown>): Promise<StepOutcome>;
   completeStep(payload: Record<string, unknown>): Promise<void>;
   failStep(payload: Record<string, unknown>): Promise<void>;
+  registerRun?(payload: Record<string, unknown>): Promise<void>;
+  summary?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  export?(payload: Record<string, unknown>): Promise<{ body: string; content_type?: string }>;
+  registerBatch?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  listCases?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
+  completeCase?(payload: Record<string, unknown>): Promise<void>;
+  failCase?(payload: Record<string, unknown>): Promise<void>;
+  registerVariants?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
+  registerWorker?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  traceEvent?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  markReviewed?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 
 export class RuntimeClient implements Runtime {
@@ -99,6 +111,50 @@ export class RuntimeClient implements Runtime {
 
   async failStep(payload: Record<string, unknown>): Promise<void> {
     await this.post("/steps/fail", payload);
+  }
+
+  async registerRun(payload: Record<string, unknown>): Promise<void> {
+    await this.post("/runs/register", payload);
+  }
+
+  async summary(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return (await this.post("/runs/summary", payload)) as Record<string, unknown>;
+  }
+
+  async export(payload: Record<string, unknown>): Promise<{ body: string; content_type?: string }> {
+    return (await this.post("/runs/export", payload)) as { body: string; content_type?: string };
+  }
+
+  async registerBatch(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return (await this.post("/batches/register", payload)) as Record<string, unknown>;
+  }
+
+  async listCases(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
+    return (await this.post("/batches/cases/list", payload)) as Array<Record<string, unknown>>;
+  }
+
+  async completeCase(payload: Record<string, unknown>): Promise<void> {
+    await this.post("/batches/cases/complete", payload);
+  }
+
+  async failCase(payload: Record<string, unknown>): Promise<void> {
+    await this.post("/batches/cases/fail", payload);
+  }
+
+  async registerVariants(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
+    return (await this.post("/variants/register", payload)) as Array<Record<string, unknown>>;
+  }
+
+  async registerWorker(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return (await this.post("/workers/register", payload)) as Record<string, unknown>;
+  }
+
+  async traceEvent(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return (await this.post("/traces/events", payload)) as Record<string, unknown>;
+  }
+
+  async markReviewed(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return (await this.post("/reviews", payload)) as Record<string, unknown>;
   }
 
   private async post(
