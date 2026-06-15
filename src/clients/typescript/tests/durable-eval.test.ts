@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -11,12 +12,18 @@ import {
 
 type Payload = Record<string, unknown>;
 
+function digestOf(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
+}
+
 class Runtime implements DurableRuntime {
   outcome: StepOutcome;
   began: Payload[] = [];
   completed: Payload[] = [];
   failed: Payload[] = [];
   cases = new Map<string, Payload[]>();
+  memos = new Map<string, unknown>();
+  memoPuts: Payload[] = [];
   variantsPayload: Payload | null = null;
   traceEvents: Payload[] = [];
   reviews: Payload[] = [];
@@ -46,15 +53,23 @@ class Runtime implements DurableRuntime {
 
   async registerBatch(payload: Payload): Promise<Payload> {
     const key = `${payload.run_id}:${payload.batch_name}`;
-    this.cases.set(
-      key,
-      (payload.cases as Payload[]).map((testCase) => ({
-        ...testCase,
-        status: "pending",
-        output: null,
-      })),
+    const existing = new Map(
+      (this.cases.get(key) ?? []).map((record) => [String(record.input_digest), record]),
     );
-    return { total: (payload.cases as Payload[]).length };
+    const records: Payload[] = [];
+    const seen = new Set<string>();
+    for (const testCase of payload.cases as Payload[]) {
+      const digest = String(testCase.input_digest);
+      if (seen.has(digest)) {
+        continue;
+      }
+      seen.add(digest);
+      records.push(
+        existing.get(digest) ?? { ...testCase, status: "pending", output: null },
+      );
+    }
+    this.cases.set(key, records);
+    return { total: records.length };
   }
 
   async listCases(payload: Payload): Promise<Payload[]> {
@@ -68,7 +83,7 @@ class Runtime implements DurableRuntime {
   async completeCase(payload: Payload): Promise<void> {
     this.completed.push(payload);
     const records = this.cases.get(`${payload.run_id}:${payload.batch_name}`) ?? [];
-    const record = records.find((item) => item.case_id === payload.case_id);
+    const record = records.find((item) => item.input_digest === payload.input_digest);
     if (record) {
       record.status = "succeeded";
       record.output = payload.output;
@@ -77,6 +92,20 @@ class Runtime implements DurableRuntime {
 
   async failCase(payload: Payload): Promise<void> {
     this.failed.push(payload);
+  }
+
+  async memoGet(payload: Payload): Promise<{ found: boolean; value: unknown }> {
+    const key = `${payload.run_id}:${payload.key_digest}`;
+    if (this.memos.has(key)) {
+      return { found: true, value: this.memos.get(key) };
+    }
+    return { found: false, value: null };
+  }
+
+  async memoPut(payload: Payload): Promise<{ ok: boolean }> {
+    this.memoPuts.push(payload);
+    this.memos.set(`${payload.run_id}:${payload.key_digest}`, payload.value);
+    return { ok: true };
   }
 
   async registerVariants(payload: Payload): Promise<Payload[]> {
@@ -235,17 +264,97 @@ test("supports user-owned orchestration", async () => {
 test("batch maps cases durably in input order", async () => {
   const runtime = new Runtime();
   const evalRun = new DurableEval({ runId: "run", runtime });
+  const cases = [{ id: "b" }, { id: "a" }];
 
-  const results = await evalRun.batch("cases", [{ id: "b" }, { id: "a" }]).map({
+  const results = await evalRun.batch("cases", cases).map({
     id: (testCase) => testCase.id,
     run: async (testCase) => ({ caseId: testCase.id }),
   });
 
   assert.deepEqual(results, [{ caseId: "b" }, { caseId: "a" }]);
   assert.deepEqual(
-    runtime.completed.slice(-2).map((payload) => payload.case_id),
-    ["b", "a"],
+    runtime.completed.slice(-2).map((payload) => payload.input_digest),
+    cases.map((testCase) => digestOf(testCase)),
   );
+});
+
+test("batch registers cases with digest identity and optional label", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  const cases = [{ id: "b" }, { id: "a" }];
+
+  await evalRun.batch("labelled", cases).map({
+    id: (testCase) => testCase.id,
+    run: async (testCase) => ({ caseId: testCase.id }),
+  });
+  await evalRun.batch("unlabelled", cases).map({
+    run: async (testCase) => ({ caseId: testCase.id }),
+  });
+
+  const labelled = runtime.cases.get("run:labelled")!;
+  assert.deepEqual(
+    labelled.map((record) => [record.input_digest, record.label]),
+    cases.map((testCase) => [digestOf(testCase), testCase.id]),
+  );
+  const unlabelled = runtime.cases.get("run:unlabelled")!;
+  assert.deepEqual(
+    unlabelled.map((record) => record.label),
+    [null, null],
+  );
+  assert.ok(labelled.every((record) => !("case_id" in record)));
+});
+
+test("batch map works without id and resumes by input digest", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  let calls = 0;
+  const run = async (testCase: { q: number }) => {
+    calls += 1;
+    return { answer: testCase.q };
+  };
+
+  const first = await evalRun.batch("cases", [{ q: 1 }]).map({ run });
+  assert.deepEqual(first, [{ answer: 1 }]);
+  assert.equal(calls, 1);
+
+  const second = await evalRun.batch("cases", [{ q: 1 }, { q: 2 }]).map({ run });
+  assert.deepEqual(second, [{ answer: 1 }, { answer: 2 }]);
+  assert.equal(calls, 2);
+});
+
+test("batch runs duplicate inputs once and fills every position", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  let calls = 0;
+
+  const results = await evalRun
+    .batch("cases", [{ q: 1 }, { q: 2 }, { q: 1 }])
+    .map({
+      run: async (testCase) => {
+        calls += 1;
+        return { answer: testCase.q };
+      },
+    });
+
+  assert.deepEqual(results, [{ answer: 1 }, { answer: 2 }, { answer: 1 }]);
+  assert.equal(calls, 2);
+  assert.equal(runtime.cases.get("run:cases")!.length, 2);
+});
+
+test("batch fills duplicate positions from resumed succeeded cases", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  let calls = 0;
+  const run = async (testCase: { q: number }) => {
+    calls += 1;
+    return { answer: testCase.q };
+  };
+
+  await evalRun.batch("cases", [{ q: 1 }]).map({ run });
+  const results = await evalRun.batch("cases", [{ q: 1 }, { q: 1 }]).map({ run });
+
+  assert.deepEqual(results, [{ answer: 1 }, { answer: 1 }]);
+  assert.equal(calls, 1);
 });
 
 test("batch records callback failures", async () => {
@@ -266,6 +375,65 @@ test("batch records callback failures", async () => {
     (runtime.failed.at(-1)?.error as { failure_class?: string }).failure_class,
     "user_code_error",
   );
+});
+
+test("memo caches values by key digest", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  let calls = 0;
+  const fn = async () => {
+    calls += 1;
+    return { result: 42 };
+  };
+
+  assert.deepEqual(await evalRun.memo({ prompt: "v1" }, fn), { result: 42 });
+  assert.deepEqual(await evalRun.memo({ prompt: "v1" }, fn), { result: 42 });
+  assert.equal(calls, 1);
+  assert.equal(runtime.memoPuts.length, 1);
+  assert.deepEqual(runtime.memoPuts[0], {
+    run_id: "run",
+    key_digest: digestOf({ prompt: "v1" }),
+    key: { prompt: "v1" },
+    value: { result: 42 },
+  });
+
+  assert.deepEqual(await evalRun.memo({ prompt: "v2" }, fn), { result: 42 });
+  assert.equal(calls, 2);
+});
+
+test("traceCase derives case id from case input", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  const testCase = { q: 1 };
+
+  await evalRun.traceCase("cases", { case: testCase }).modelRequest({ messages: [] });
+
+  assert.equal(runtime.traceEvents[0].case_id, digestOf(testCase));
+});
+
+test("traceCase requires exactly one of case or caseId", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+
+  assert.throws(() => evalRun.traceCase("cases", {}), TypeError);
+  assert.throws(
+    () => evalRun.traceCase("cases", { case: { q: 1 }, caseId: "case" }),
+    TypeError,
+  );
+});
+
+test("markReviewed accepts case input alternative", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  const testCase = { q: 1 };
+
+  await evalRun.markReviewed({
+    batchName: "cases",
+    case: testCase,
+    decision: "reviewed_pass",
+  });
+
+  assert.equal(runtime.reviews[0].case_id, digestOf(testCase));
 });
 
 test("variants trace worker review summary and export helpers call runtime", async () => {

@@ -93,8 +93,37 @@ export class DurableEval {
     return new Worker(this, record);
   }
 
-  traceCase(batchName: string, options: { caseId: string; attempt?: number }): TraceCase {
-    return new TraceCase(this, batchName, options.caseId, options.attempt ?? 1);
+  traceCase(
+    batchName: string,
+    options: { case?: unknown; caseId?: string; attempt?: number },
+  ): TraceCase {
+    return new TraceCase(this, batchName, resolveCaseId(options), options.attempt ?? 1);
+  }
+
+  async memo<TValue>(
+    key: unknown,
+    fn: () => TValue | Promise<TValue>,
+  ): Promise<Awaited<TValue>> {
+    const runtime = await this.getRuntime();
+    assertRuntimeMethod(runtime.memoGet, "memoGet");
+    assertRuntimeMethod(runtime.memoPut, "memoPut");
+    const keyDigest = digestJson(key);
+    const cached = await runtime.memoGet({
+      run_id: this.runId,
+      key_digest: keyDigest,
+    });
+    if (cached.found) {
+      return cached.value as Awaited<TValue>;
+    }
+    const value = await fn();
+    assertJsonSerializable(value, "memo value");
+    await runtime.memoPut({
+      run_id: this.runId,
+      key_digest: keyDigest,
+      key,
+      value,
+    });
+    return value as Awaited<TValue>;
   }
 
   async summary(): Promise<Record<string, unknown>> {
@@ -111,7 +140,8 @@ export class DurableEval {
 
   async markReviewed(options: {
     batchName: string;
-    caseId: string;
+    case?: unknown;
+    caseId?: string;
     decision: string;
     reviewer?: string;
     note?: string;
@@ -121,7 +151,7 @@ export class DurableEval {
     return await runtime.markReviewed({
       run_id: this.runId,
       batch_name: options.batchName,
-      case_id: options.caseId,
+      case_id: resolveCaseId(options),
       reviewer: options.reviewer ?? "user",
       decision: options.decision,
       note: options.note,
@@ -213,49 +243,67 @@ export class Batch<TCase> {
   ) {}
 
   async map<TOutput>(options: {
-    id: (testCase: TCase) => string;
     run: (testCase: TCase) => TOutput | Promise<TOutput>;
+    id?: (testCase: TCase) => string;
     concurrency?: number;
     progress?: (summary: Record<string, number>) => void;
   }): Promise<TOutput[]> {
     const runtime = await this.runtime();
     const records = await this.register(options.id);
-    const byCaseId = new Map(records.map((record) => [String(record.case_id), record]));
+    const byDigest = new Map(records.map((record) => [String(record.input_digest), record]));
+    const positionsByDigest = new Map<string, number[]>();
+    for (const [index, testCase] of this.cases.entries()) {
+      const digest = digestJson(testCase);
+      const positions = positionsByDigest.get(digest);
+      if (positions) {
+        positions.push(index);
+      } else {
+        positionsByDigest.set(digest, [index]);
+      }
+    }
     const outputs = new Array<TOutput>(this.cases.length);
+    const runnable: Array<{ digest: string; positions: number[] }> = [];
+    for (const [digest, positions] of positionsByDigest) {
+      const record = byDigest.get(digest);
+      if (!record) {
+        throw new Error(`missing registered case: ${digest}`);
+      }
+      if (record.status === "succeeded") {
+        for (const position of positions) {
+          outputs[position] = record.output as TOutput;
+        }
+        continue;
+      }
+      if (record.status === "terminal") {
+        continue;
+      }
+      runnable.push({ digest, positions });
+    }
     let cursor = 0;
     const concurrency = options.concurrency ?? 1;
 
     const worker = async (): Promise<void> => {
-      while (cursor < this.cases.length) {
-        const index = cursor++;
-        const testCase = this.cases[index];
-        const record = byCaseId.get(String(options.id(testCase)));
-        if (!record) {
-          throw new Error(`missing registered case: ${options.id(testCase)}`);
-        }
-        if (record.status === "succeeded") {
-          outputs[index] = record.output as TOutput;
-          continue;
-        }
-        if (record.status === "terminal") {
-          continue;
-        }
+      while (cursor < runnable.length) {
+        const { digest, positions } = runnable[cursor++];
+        const testCase = this.cases[positions[0]];
         try {
           const output = await options.run(testCase);
           assertJsonSerializable(output, `batch output for ${this.batchName}`);
           await runtime.completeCase!({
             run_id: this.evalRun.runId,
             batch_name: this.batchName,
-            case_id: record.case_id,
+            input_digest: digest,
             output,
           });
-          outputs[index] = output;
+          for (const position of positions) {
+            outputs[position] = output;
+          }
           options.progress?.(await this.summary());
         } catch (error) {
           await runtime.failCase!({
             run_id: this.evalRun.runId,
             batch_name: this.batchName,
-            case_id: record.case_id,
+            input_digest: digest,
             error: errorPayload(error),
           });
           throw error;
@@ -305,16 +353,16 @@ export class Batch<TCase> {
   }
 
   private async register(
-    id: (testCase: TCase) => string,
+    id?: (testCase: TCase) => string,
   ): Promise<Array<Record<string, unknown>>> {
     const runtime = await this.runtime();
     await runtime.registerBatch!({
       run_id: this.evalRun.runId,
       batch_name: this.batchName,
       cases: this.cases.map((testCase) => ({
-        case_id: id(testCase),
         input_digest: digestJson(testCase),
         input: testCase,
+        label: id ? id(testCase) : null,
       })),
     });
     return await runtime.listCases!({
@@ -409,15 +457,46 @@ export class TraceCase {
   }
 }
 
+function resolveCaseId(options: { case?: unknown; caseId?: string }): string {
+  const hasCase = options.case !== undefined;
+  const hasCaseId = options.caseId !== undefined;
+  if (hasCase === hasCaseId) {
+    throw new TypeError("exactly one of case or caseId is required");
+  }
+  return hasCase ? digestJson(options.case) : String(options.caseId);
+}
+
 function inputDigestFor(stepName: string, args: unknown[]): string {
-  const inputJson = assertJsonSerializable({ args, kwargs: {} }, `step input for ${stepName}`);
+  const inputJson = canonicalJson({ args, kwargs: {} }, `step input for ${stepName}`);
   return createHash("sha256").update(inputJson, "utf8").digest("hex");
 }
 
 function digestJson(value: unknown): string {
   return createHash("sha256")
-    .update(assertJsonSerializable(value, "durable eval payload"), "utf8")
+    .update(canonicalJson(value, "durable eval payload"), "utf8")
     .digest("hex");
+}
+
+// Digests must match the Python client byte-for-byte (sorted keys, compact, UTF-8)
+// so the same logical input has the same identity from either client.
+function canonicalJson(value: unknown, label: string): string {
+  try {
+    const json = JSON.stringify(value, (_key, val: unknown) =>
+      val !== null && typeof val === "object" && !Array.isArray(val)
+        ? Object.fromEntries(
+            Object.keys(val as Record<string, unknown>)
+              .sort()
+              .map((key) => [key, (val as Record<string, unknown>)[key]]),
+          )
+        : val,
+    );
+    if (json === undefined) {
+      throw new TypeError("value is undefined");
+    }
+    return json;
+  } catch (error) {
+    throw new TypeError(`${label} must be JSON-serializable`, { cause: error });
+  }
 }
 
 function assertJsonSerializable(value: unknown, label: string): string {

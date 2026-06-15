@@ -15,10 +15,16 @@ from .runtime import RuntimeClient
 
 def _json_digest(value: Any) -> str:
     try:
-        payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     except TypeError as exc:
         raise ValueError("durable eval payloads must be JSON-serializable") from exc
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _resolve_case_id(case: Any, case_id: str | None) -> str:
+    if (case is None) == (case_id is None):
+        raise ValueError("provide exactly one of case or case_id")
+    return case_id if case_id is not None else _json_digest(case)
 
 
 class DurableEval:
@@ -67,8 +73,45 @@ class DurableEval:
         )
         return Worker(self, record)
 
-    def trace_case(self, batch_name: str, *, case_id: str, attempt: int = 1) -> "TraceCase":
-        return TraceCase(self, batch_name, case_id, attempt)
+    def trace_case(
+        self,
+        batch_name: str,
+        *,
+        case: Any = None,
+        case_id: str | None = None,
+        attempt: int = 1,
+    ) -> "TraceCase":
+        return TraceCase(self, batch_name, _resolve_case_id(case, case_id), attempt)
+
+    def memo(self, key: Any, fn: Callable[[], Any]) -> Any:
+        key_digest = _json_digest(key)
+        record = self._runtime.memo_get({"run_id": self.run_id, "key_digest": key_digest})
+        if record["found"]:
+            return record["value"]
+        value = fn()
+        if inspect.isawaitable(value):
+            if inspect.iscoroutine(value):
+                value.close()
+            raise TypeError("memo callback returned an awaitable")
+        self._runtime.memo_put(
+            {"run_id": self.run_id, "key_digest": key_digest, "key": key, "value": value}
+        )
+        return value
+
+    async def amemo(self, key: Any, fn: Callable[[], Any]) -> Any:
+        key_digest = _json_digest(key)
+        record = await self._runtime.amemo_get(
+            {"run_id": self.run_id, "key_digest": key_digest}
+        )
+        if record["found"]:
+            return record["value"]
+        value = fn()
+        if inspect.isawaitable(value):
+            value = await value
+        await self._runtime.amemo_put(
+            {"run_id": self.run_id, "key_digest": key_digest, "key": key, "value": value}
+        )
+        return value
 
     def summary(self) -> dict[str, Any]:
         return self._runtime.summary({"run_id": self.run_id})
@@ -80,7 +123,8 @@ class DurableEval:
         self,
         *,
         batch_name: str,
-        case_id: str,
+        case: Any = None,
+        case_id: str | None = None,
         decision: str,
         reviewer: str = "user",
         note: str | None = None,
@@ -89,7 +133,7 @@ class DurableEval:
             {
                 "run_id": self.run_id,
                 "batch_name": batch_name,
-                "case_id": case_id,
+                "case_id": _resolve_case_id(case, case_id),
                 "reviewer": reviewer,
                 "decision": decision,
                 "note": note,
@@ -106,21 +150,22 @@ class Batch:
     def map(
         self,
         *,
-        id: Callable[[Any], str],
         run: Callable[[Any], Any],
+        id: Callable[[Any], str] | None = None,
         concurrency: int = 1,
         progress: Callable[[dict[str, int]], None] | None = None,
     ) -> list[Any]:
         records = self._register(id)
         outputs: list[Any] = [None] * len(self.cases)
-        runnable: list[tuple[int, Any, dict[str, Any]]] = []
-        by_case_id = {record["case_id"]: record for record in records}
-        for index, case in enumerate(self.cases):
-            record = by_case_id[str(id(case))]
+        runnable: list[tuple[list[int], Any, dict[str, Any]]] = []
+        by_digest = {record["input_digest"]: record for record in records}
+        for digest, indexes in self._positions().items():
+            record = by_digest[digest]
             if record["status"] == "succeeded":
-                outputs[index] = record.get("output")
+                for index in indexes:
+                    outputs[index] = record.get("output")
             elif record["status"] != "terminal":
-                runnable.append((index, case, record))
+                runnable.append((indexes, self.cases[indexes[0]], record))
 
         if concurrency <= 1:
             for item in runnable:
@@ -138,17 +183,17 @@ class Batch:
     async def amap(
         self,
         *,
-        id: Callable[[Any], str],
         run: Callable[[Any], Any],
+        id: Callable[[Any], str] | None = None,
         concurrency: int = 10,
         progress: Callable[[dict[str, int]], None] | None = None,
     ) -> list[Any]:
         records = self._register(id)
         outputs: list[Any] = [None] * len(self.cases)
         semaphore = asyncio.Semaphore(concurrency)
-        by_case_id = {record["case_id"]: record for record in records}
+        by_digest = {record["input_digest"]: record for record in records}
 
-        async def run_one(index: int, case: Any, record: dict[str, Any]) -> None:
+        async def run_one(indexes: list[int], case: Any, record: dict[str, Any]) -> None:
             async with semaphore:
                 try:
                     result = run(case)
@@ -159,7 +204,7 @@ class Batch:
                         {
                             "run_id": self.eval.run_id,
                             "batch_name": self.batch_name,
-                            "case_id": record["case_id"],
+                            "input_digest": record["input_digest"],
                             "error": _error_payload(exc),
                         }
                     )
@@ -168,21 +213,23 @@ class Batch:
                     {
                         "run_id": self.eval.run_id,
                         "batch_name": self.batch_name,
-                        "case_id": record["case_id"],
+                        "input_digest": record["input_digest"],
                         "output": result,
                     }
                 )
-                outputs[index] = result
+                for index in indexes:
+                    outputs[index] = result
                 if progress:
                     progress(self.summary())
 
         tasks = []
-        for index, case in enumerate(self.cases):
-            record = by_case_id[str(id(case))]
+        for digest, indexes in self._positions().items():
+            record = by_digest[digest]
             if record["status"] == "succeeded":
-                outputs[index] = record.get("output")
+                for index in indexes:
+                    outputs[index] = record.get("output")
             elif record["status"] != "terminal":
-                tasks.append(asyncio.create_task(run_one(index, case, record)))
+                tasks.append(asyncio.create_task(run_one(indexes, self.cases[indexes[0]], record)))
         if tasks:
             await asyncio.gather(*tasks)
         return outputs
@@ -211,12 +258,18 @@ class Batch:
             {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": statuses}
         )
 
-    def _register(self, id: Callable[[Any], str]) -> list[dict[str, Any]]:
+    def _positions(self) -> dict[str, list[int]]:
+        positions: dict[str, list[int]] = {}
+        for index, case in enumerate(self.cases):
+            positions.setdefault(_json_digest(case), []).append(index)
+        return positions
+
+    def _register(self, id: Callable[[Any], str] | None) -> list[dict[str, Any]]:
         case_payloads = [
             {
-                "case_id": str(id(case)),
                 "input_digest": _json_digest(case),
                 "input": case,
+                "label": str(id(case)) if id else None,
             }
             for case in self.cases
         ]
@@ -233,12 +286,12 @@ class Batch:
 
     def _run_one(
         self,
-        item: tuple[int, Any, dict[str, Any]],
+        item: tuple[list[int], Any, dict[str, Any]],
         run: Callable[[Any], Any],
         outputs: list[Any],
         progress: Callable[[dict[str, int]], None] | None,
     ) -> None:
-        index, case, record = item
+        indexes, case, record = item
         try:
             result = run(case)
             if inspect.isawaitable(result):
@@ -250,7 +303,7 @@ class Batch:
                 {
                     "run_id": self.eval.run_id,
                     "batch_name": self.batch_name,
-                    "case_id": record["case_id"],
+                    "input_digest": record["input_digest"],
                     "error": _error_payload(exc),
                 }
             )
@@ -259,11 +312,12 @@ class Batch:
             {
                 "run_id": self.eval.run_id,
                 "batch_name": self.batch_name,
-                "case_id": record["case_id"],
+                "input_digest": record["input_digest"],
                 "output": result,
             }
         )
-        outputs[index] = result
+        for index in indexes:
+            outputs[index] = result
         if progress:
             progress(self.summary())
 

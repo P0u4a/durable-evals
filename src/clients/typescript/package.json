@@ -1,7 +1,7 @@
 {
   "name": "durable-evals",
-  "version": "0.1.0",
-  "description": "NodeJS client for durable evals.",
+  "version": "0.2.0",
+  "description": "TypeScript client for durable evals.",
   "type": "module",
   "packageManager": "pnpm@10.20.0",
   "main": "./dist/index.js",

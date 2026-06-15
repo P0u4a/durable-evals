@@ -56,7 +56,12 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
         step_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> str:
         try:
-            input_json = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True)
+            input_json = json.dumps(
+                {"args": args, "kwargs": kwargs},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
         except TypeError as exc:
             raise ValueError(f"step input for {step_name} must be JSON-serializable") from exc
         return hashlib.sha256(input_json.encode("utf-8")).hexdigest()

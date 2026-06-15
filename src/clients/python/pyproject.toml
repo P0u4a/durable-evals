@@ -1,6 +1,6 @@
 [project]
 name = "durable-evals"
-version = "0.1.0"
+version = "0.2.0"
 description = "Durable eval harness for long-running agent and model evals."
 requires-python = ">=3.11"
 dependencies = [

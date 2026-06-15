@@ -111,6 +111,12 @@ class RuntimeClient:
     def mark_reviewed(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/reviews", payload)
 
+    def memo_get(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/memos/get", payload)
+
+    def memo_put(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/memos/put", payload)
+
     async def abegin_step(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._apost("/steps/begin", payload)
 
@@ -128,6 +134,12 @@ class RuntimeClient:
 
     async def afail_case(self, payload: dict[str, Any]) -> None:
         await self._apost("/batches/cases/fail", payload)
+
+    async def amemo_get(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._apost("/memos/get", payload)
+
+    async def amemo_put(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._apost("/memos/put", payload)
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = httpx.post(f"{self.base_url}{path}", json=payload, timeout=30)

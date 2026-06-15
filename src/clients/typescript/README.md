@@ -1,6 +1,6 @@
-# Durable Evals Node Client
+# Durable Evals TypeScript Client
 
-Node client for Durable Evals.
+TypeScript client for Durable Evals.
 
 ## Batch Evals
 
@@ -13,14 +13,27 @@ const evalRun = new DurableEval({
 });
 
 const results = await evalRun.batch("inferCases", cases).map({
-  id: (testCase) => testCase.id,
   run: async (testCase) => model.infer(testCase),
+  id: (testCase) => testCase.id, // optional human-readable label
   concurrency: 8,
 });
 ```
 
-Completed cases are skipped on rerun. Failed retryable cases can be retried, and
-terminal cases are preserved unless explicitly reset.
+Case identity is the SHA-256 digest of the case input, so completed cases are
+skipped on rerun and a changed input becomes a new pending case. Duplicate
+inputs run once and their output is reused at every position. Failed retryable
+cases can be retried, and terminal cases are preserved unless explicitly reset.
+
+## Memos
+
+```ts
+const value = await evalRun.memo({ kind: "embedding", text }, async () =>
+  model.embed(text),
+);
+```
+
+Memo keys are any JSON-serializable value. The callback runs once per key
+digest within a run; later calls return the stored value.
 
 ## Durable Steps
 
@@ -48,17 +61,23 @@ await evalRun.variants("prompt", [
   { name: "candidate", config: { prompt: "v2" } },
 ]);
 
-const trace = evalRun.traceCase("agentCases", { caseId: "case-1" });
+const trace = evalRun.traceCase("agentCases", { case: testCase });
 await trace.modelRequest({ messages: [] });
 await trace.modelResponse({ content: "ok" });
 await trace.scoringEvent({ score: 1 });
 
 await evalRun.markReviewed({
   batchName: "agentCases",
-  caseId: "case-1",
+  case: testCase,
   decision: "reviewed_pass",
   note: "Correct tool sequence",
 });
+```
+
+`traceCase` and `markReviewed` take exactly one of `case` (digested to the case
+id) or `caseId` (an explicit id, by convention the input digest).
+
+```ts
 
 const summary = await evalRun.summary();
 const manifestJson = await evalRun.export("manifest_json");

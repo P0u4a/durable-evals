@@ -22,6 +22,8 @@ export interface Runtime {
   listCases?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
   completeCase?(payload: Record<string, unknown>): Promise<void>;
   failCase?(payload: Record<string, unknown>): Promise<void>;
+  memoGet?(payload: Record<string, unknown>): Promise<{ found: boolean; value: unknown }>;
+  memoPut?(payload: Record<string, unknown>): Promise<{ ok: boolean }>;
   registerVariants?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
   registerWorker?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
   traceEvent?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
@@ -139,6 +141,14 @@ export class RuntimeClient implements Runtime {
 
   async failCase(payload: Record<string, unknown>): Promise<void> {
     await this.post("/batches/cases/fail", payload);
+  }
+
+  async memoGet(payload: Record<string, unknown>): Promise<{ found: boolean; value: unknown }> {
+    return (await this.post("/memos/get", payload)) as { found: boolean; value: unknown };
+  }
+
+  async memoPut(payload: Record<string, unknown>): Promise<{ ok: boolean }> {
+    return (await this.post("/memos/put", payload)) as { ok: boolean };
   }
 
   async registerVariants(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
