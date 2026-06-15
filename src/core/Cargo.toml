@@ -11,3 +11,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+postgres = { workspace = true, optional = true }
+r2d2 = { workspace = true, optional = true }
+r2d2_postgres = { workspace = true, optional = true }
+
+[features]
+postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]

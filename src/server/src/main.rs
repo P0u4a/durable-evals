@@ -10,12 +10,8 @@ use durable_evals_core::{Error as StoreError, *};
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let db_path = env::var("DURABLE_EVALS_DB").unwrap_or_else(|_| ".durable/evals.sqlite".into());
-    if let Some(parent) = std::path::Path::new(&db_path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let runtime = Runtime::new(SqliteStore::open(db_path)?);
+    let db = env::var("DURABLE_EVALS_DB").unwrap_or_else(|_| ".durable/evals.sqlite".into());
+    let runtime = build_runtime(&db)?;
     let app = Router::new()
         .route("/health", get(health))
         .route("/runs/register", post(register_run))
@@ -53,6 +49,27 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn build_runtime(db: &str) -> anyhow::Result<Runtime> {
+    if db.starts_with("postgres://") || db.starts_with("postgresql://") {
+        #[cfg(feature = "postgres")]
+        {
+            return Ok(Runtime::new(PostgresStore::connect(db)?));
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            anyhow::bail!(
+                "DURABLE_EVALS_DB requests postgres but the server was built without the `postgres` feature"
+            );
+        }
+    }
+    if let Some(parent) = std::path::Path::new(db).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(Runtime::new(SqliteStore::open(db)?))
 }
 
 async fn health() -> Json<Health> {

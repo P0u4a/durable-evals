@@ -8,21 +8,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::store::{Error, Result, Store};
 use crate::types::*;
-
-pub type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-    #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("step state not found")]
-    StepNotFound,
-    #[error("case not found")]
-    CaseNotFound,
-}
 
 /// Cases are content-addressed: edits to an input create a new row under a new digest.
 /// Rows from earlier registrations are kept (so reverting an input reuses its old
@@ -1003,6 +990,77 @@ impl SqliteStore {
             )?;
         }
         Ok(())
+    }
+}
+
+impl Store for SqliteStore {
+    fn register_run(&self, req: RegisterRunRequest) -> Result<()> {
+        self.register_run(req)
+    }
+    fn begin_step(&self, req: BeginStepRequest) -> Result<StepOutcome> {
+        self.begin_step(req)
+    }
+    fn complete_step(&self, req: CompleteStepRequest) -> Result<()> {
+        self.complete_step(req)
+    }
+    fn fail_step(&self, req: FailStepRequest) -> Result<()> {
+        self.fail_step(req)
+    }
+    fn register_batch(&self, req: RegisterBatchRequest) -> Result<BatchSummary> {
+        self.register_batch(req)
+    }
+    fn start_case(&self, req: ListCasesRequest) -> Result<Option<CaseRecord>> {
+        self.start_case(req)
+    }
+    fn complete_case(&self, req: CompleteCaseRequest) -> Result<()> {
+        self.complete_case(req)
+    }
+    fn fail_case(&self, req: FailCaseRequest) -> Result<()> {
+        self.fail_case(req)
+    }
+    fn list_cases(&self, req: ListCasesRequest) -> Result<Vec<CaseRecord>> {
+        self.list_cases(req)
+    }
+    fn register_variants(&self, req: RegisterVariantsRequest) -> Result<Vec<VariantRecord>> {
+        self.register_variants(req)
+    }
+    fn list_variants(&self, run_id: &str) -> Result<Vec<VariantRecord>> {
+        self.list_variants(run_id)
+    }
+    fn register_worker(&self, req: RegisterWorkerRequest) -> Result<WorkerRecord> {
+        self.register_worker(req)
+    }
+    fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
+        self.list_workers()
+    }
+    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<()> {
+        self.heartbeat_step(req)
+    }
+    fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord> {
+        self.add_trace_event(req)
+    }
+    fn list_trace_events(
+        &self,
+        run_id: &str,
+        batch_name: &str,
+        case_id: &str,
+    ) -> Result<Vec<TraceEventRecord>> {
+        self.list_trace_events(run_id, batch_name, case_id)
+    }
+    fn mark_reviewed(&self, req: ReviewRequest) -> Result<ReviewRecord> {
+        self.mark_reviewed(req)
+    }
+    fn memo_get(&self, req: MemoGetRequest) -> Result<MemoGetResponse> {
+        self.memo_get(req)
+    }
+    fn memo_put(&self, req: MemoPutRequest) -> Result<()> {
+        self.memo_put(req)
+    }
+    fn summary(&self, req: SummaryRequest) -> Result<RunSummary> {
+        self.summary(req)
+    }
+    fn export(&self, req: ExportRequest) -> Result<ExportResponse> {
+        self.export(req)
     }
 }
 
