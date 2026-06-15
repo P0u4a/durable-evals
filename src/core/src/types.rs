@@ -56,10 +56,11 @@ pub struct RegisterRunRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchCaseInput {
-    pub case_id: String,
     pub input_digest: String,
     #[serde(default)]
     pub input: Value,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +74,7 @@ pub struct RegisterBatchRequest {
 pub struct CompleteCaseRequest {
     pub run_id: String,
     pub batch_name: String,
-    pub case_id: String,
+    pub input_digest: String,
     pub output: Value,
 }
 
@@ -81,7 +82,7 @@ pub struct CompleteCaseRequest {
 pub struct FailCaseRequest {
     pub run_id: String,
     pub batch_name: String,
-    pub case_id: String,
+    pub input_digest: String,
     pub error: ErrorInfo,
 }
 
@@ -97,8 +98,9 @@ pub struct ListCasesRequest {
 pub struct CaseRecord {
     pub run_id: String,
     pub batch_name: String,
-    pub case_id: String,
     pub input_digest: String,
+    #[serde(default)]
+    pub label: Option<String>,
     pub status: String,
     pub attempt: u32,
     pub input: Value,
@@ -346,6 +348,29 @@ pub struct ReviewRecord {
     pub decision: ReviewDecision,
     pub note: Option<String>,
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoGetRequest {
+    pub run_id: String,
+    pub key_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoPutRequest {
+    pub run_id: String,
+    pub key_digest: String,
+    #[serde(default)]
+    pub key: Value,
+    #[serde(default)]
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoGetResponse {
+    pub found: bool,
+    #[serde(default)]
+    pub value: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

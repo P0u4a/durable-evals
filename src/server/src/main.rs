@@ -39,6 +39,8 @@ async fn main() -> anyhow::Result<()> {
             "/traces/:run_id/:batch_name/:case_id",
             get(list_trace_events),
         )
+        .route("/memos/get", post(memo_get))
+        .route("/memos/put", post(memo_put))
         .route("/reviews", post(mark_reviewed))
         .with_state(runtime);
 
@@ -195,6 +197,23 @@ async fn list_trace_events(
         .map_err(store_error)
 }
 
+async fn memo_get(
+    State(runtime): State<Runtime>,
+    Json(req): Json<MemoGetRequest>,
+) -> Result<Json<MemoGetResponse>, (axum::http::StatusCode, Json<ErrorInfo>)> {
+    runtime.memo_get(req).map(Json).map_err(store_error)
+}
+
+async fn memo_put(
+    State(runtime): State<Runtime>,
+    Json(req): Json<MemoPutRequest>,
+) -> Result<Json<Health>, (axum::http::StatusCode, Json<ErrorInfo>)> {
+    runtime
+        .memo_put(req)
+        .map(|_| Json(Health { ok: true }))
+        .map_err(store_error)
+}
+
 async fn mark_reviewed(
     State(runtime): State<Runtime>,
     Json(req): Json<ReviewRequest>,
@@ -247,16 +266,6 @@ fn store_error(error: StoreError) -> (axum::http::StatusCode, Json<ErrorInfo>) {
             axum::http::StatusCode::NOT_FOUND,
             Json(ErrorInfo {
                 error_type: "CaseNotFound".to_string(),
-                message: error.to_string(),
-                failure_class: FailureClass::RunnerError,
-                stack: None,
-                retryable: Some(false),
-            }),
-        ),
-        StoreError::DuplicateCaseId(_) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(ErrorInfo {
-                error_type: "DuplicateCaseId".to_string(),
                 message: error.to_string(),
                 failure_class: FailureClass::RunnerError,
                 stack: None,

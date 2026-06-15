@@ -22,9 +22,15 @@ pub enum Error {
     StepNotFound,
     #[error("case not found")]
     CaseNotFound,
-    #[error("duplicate case id: {0}")]
-    DuplicateCaseId(String),
 }
+
+/// Cases are content-addressed: edits to an input create a new row under a new digest.
+/// Rows from earlier registrations are kept (so reverting an input reuses its old
+/// output) but only the latest registration's generation counts as the batch.
+const CURRENT_GENERATION: &str = "batch_cases.generation = COALESCE(
+    (SELECT b.generation FROM batches b
+     WHERE b.run_id = batch_cases.run_id AND b.batch_name = batch_cases.batch_name),
+    batch_cases.generation)";
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -279,36 +285,48 @@ impl SqliteStore {
     }
 
     pub fn register_batch(&self, req: RegisterBatchRequest) -> Result<BatchSummary> {
-        let mut seen = std::collections::BTreeSet::new();
-        for case in &req.cases {
-            if !seen.insert(case.case_id.clone()) {
-                return Err(Error::DuplicateCaseId(case.case_id.clone()));
-            }
-        }
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO batches (run_id, batch_name, generation)
+             VALUES (?1, ?2, 1)
+             ON CONFLICT(run_id, batch_name) DO UPDATE SET generation = generation + 1",
+            params![req.run_id, req.batch_name],
+        )?;
+        let generation: u32 = tx.query_row(
+            "SELECT generation FROM batches WHERE run_id = ?1 AND batch_name = ?2",
+            params![req.run_id, req.batch_name],
+            |row| row.get(0),
+        )?;
+        // Identical inputs collapse to one content-addressed case; first occurrence wins.
+        let mut seen = std::collections::BTreeSet::new();
         for (idx, case) in req.cases.iter().enumerate() {
+            if !seen.insert(case.input_digest.clone()) {
+                continue;
+            }
             tx.execute(
                 "INSERT INTO batch_cases
-                 (run_id, batch_name, case_id, position, input_digest, input_json, status,
-                  attempt, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, datetime('now'), datetime('now'))
-                 ON CONFLICT(run_id, batch_name, case_id) DO UPDATE SET
+                 (run_id, batch_name, input_digest, label, position, generation, input_json,
+                  status, attempt, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, datetime('now'), datetime('now'))
+                 ON CONFLICT(run_id, batch_name, input_digest) DO UPDATE SET
+                    label = excluded.label,
                     position = excluded.position,
-                    input_digest = excluded.input_digest,
-                    input_json = excluded.input_json,
+                    generation = excluded.generation,
                     updated_at = datetime('now')",
                 params![
                     req.run_id,
                     req.batch_name,
-                    case.case_id,
-                    idx as u32,
                     case.input_digest,
+                    case.label,
+                    idx as u32,
+                    generation,
                     serde_json::to_string(&case.input)?
                 ],
             )?;
         }
         tx.commit()?;
+        drop(conn); // release before batch_summary re-locks the connection
         self.batch_summary(&req.run_id, &req.batch_name)
     }
 
@@ -316,13 +334,16 @@ impl SqliteStore {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let record = conn
             .query_row(
-                "SELECT run_id, batch_name, case_id, input_digest, status, attempt, input_json,
-                        output_json, error_json, started_at, completed_at
-                 FROM batch_cases
-                 WHERE run_id = ?1 AND batch_name = ?2
-                   AND (?3 = '[]' OR status IN (SELECT value FROM json_each(?3)))
-                 ORDER BY position
-                 LIMIT 1",
+                &format!(
+                    "SELECT run_id, batch_name, input_digest, label, status, attempt, input_json,
+                            output_json, error_json, started_at, completed_at
+                     FROM batch_cases
+                     WHERE run_id = ?1 AND batch_name = ?2
+                       AND (?3 = '[]' OR status IN (SELECT value FROM json_each(?3)))
+                       AND {CURRENT_GENERATION}
+                     ORDER BY position
+                     LIMIT 1"
+                ),
                 params![
                     req.run_id,
                     req.batch_name,
@@ -337,8 +358,8 @@ impl SqliteStore {
                  SET status = 'running', attempt = attempt + 1,
                      started_at = COALESCE(started_at, datetime('now')),
                      updated_at = datetime('now')
-                 WHERE run_id = ?1 AND batch_name = ?2 AND case_id = ?3",
-                params![case.run_id, case.batch_name, case.case_id],
+                 WHERE run_id = ?1 AND batch_name = ?2 AND input_digest = ?3",
+                params![case.run_id, case.batch_name, case.input_digest],
             )?;
             Ok(Some(CaseRecord {
                 status: "running".to_string(),
@@ -357,11 +378,11 @@ impl SqliteStore {
             "UPDATE batch_cases
              SET status = 'succeeded', output_json = ?4, error_json = NULL,
                  completed_at = datetime('now'), updated_at = datetime('now')
-             WHERE run_id = ?1 AND batch_name = ?2 AND case_id = ?3",
+             WHERE run_id = ?1 AND batch_name = ?2 AND input_digest = ?3",
             params![
                 req.run_id,
                 req.batch_name,
-                req.case_id,
+                req.input_digest,
                 serde_json::to_string(&req.output)?
             ],
         )?;
@@ -383,11 +404,11 @@ impl SqliteStore {
         let updated = conn.execute(
             "UPDATE batch_cases
              SET status = ?4, error_json = ?5, completed_at = datetime('now'), updated_at = datetime('now')
-             WHERE run_id = ?1 AND batch_name = ?2 AND case_id = ?3",
+             WHERE run_id = ?1 AND batch_name = ?2 AND input_digest = ?3",
             params![
                 req.run_id,
                 req.batch_name,
-                req.case_id,
+                req.input_digest,
                 status,
                 serde_json::to_string(&req.error)?
             ],
@@ -400,14 +421,15 @@ impl SqliteStore {
 
     pub fn list_cases(&self, req: ListCasesRequest) -> Result<Vec<CaseRecord>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT run_id, batch_name, case_id, input_digest, status, attempt, input_json,
+        let mut stmt = conn.prepare(&format!(
+            "SELECT run_id, batch_name, input_digest, label, status, attempt, input_json,
                     output_json, error_json, started_at, completed_at
              FROM batch_cases
              WHERE run_id = ?1 AND batch_name = ?2
                AND (?3 = '[]' OR status IN (SELECT value FROM json_each(?3)))
-             ORDER BY position",
-        )?;
+               AND {CURRENT_GENERATION}
+             ORDER BY position"
+        ))?;
         let statuses = serde_json::to_string(&req.statuses)?;
         let rows = stmt.query_map(params![req.run_id, req.batch_name, statuses], case_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -416,7 +438,11 @@ impl SqliteStore {
 
     pub fn batch_summary(&self, run_id: &str, batch_name: &str) -> Result<BatchSummary> {
         let counts = self.counts(
-            "SELECT status, COUNT(*) FROM batch_cases WHERE run_id = ?1 AND batch_name = ?2 GROUP BY status",
+            &format!(
+                "SELECT status, COUNT(*) FROM batch_cases
+                 WHERE run_id = ?1 AND batch_name = ?2 AND {CURRENT_GENERATION}
+                 GROUP BY status"
+            ),
             params![run_id, batch_name],
         )?;
         Ok(BatchSummary {
@@ -616,6 +642,45 @@ impl SqliteStore {
         })
     }
 
+    pub fn memo_get(&self, req: MemoGetRequest) -> Result<MemoGetResponse> {
+        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM memos WHERE run_id = ?1 AND key_digest = ?2",
+                params![req.run_id, req.key_digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match value {
+            Some(json) => Ok(MemoGetResponse {
+                found: true,
+                value: Some(parse_required(json)?),
+            }),
+            None => Ok(MemoGetResponse {
+                found: false,
+                value: None,
+            }),
+        }
+    }
+
+    pub fn memo_put(&self, req: MemoPutRequest) -> Result<()> {
+        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        conn.execute(
+            "INSERT INTO memos (run_id, key_digest, key_json, value_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))
+             ON CONFLICT(run_id, key_digest) DO UPDATE SET
+                key_json = excluded.key_json,
+                value_json = excluded.value_json",
+            params![
+                req.run_id,
+                req.key_digest,
+                serde_json::to_string(&req.key)?,
+                serde_json::to_string(&req.value)?
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn summary(&self, req: SummaryRequest) -> Result<RunSummary> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let run = conn
@@ -645,7 +710,11 @@ impl SqliteStore {
                 params![req.run_id.clone()],
             )?,
             case_counts: self.counts(
-                "SELECT status, COUNT(*) FROM batch_cases WHERE run_id = ?1 GROUP BY status",
+                &format!(
+                    "SELECT status, COUNT(*) FROM batch_cases
+                     WHERE run_id = ?1 AND {CURRENT_GENERATION}
+                     GROUP BY status"
+                ),
                 params![req.run_id.clone()],
             )?,
             artifact_count: self.scalar_count(
@@ -671,11 +740,12 @@ impl SqliteStore {
             }),
             ExportKind::CaseResultsJsonl => {
                 let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-                let mut stmt = conn.prepare(
-                    "SELECT run_id, batch_name, case_id, input_digest, status, attempt, input_json,
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT run_id, batch_name, input_digest, label, status, attempt, input_json,
                             output_json, error_json, started_at, completed_at
-                     FROM batch_cases WHERE run_id = ?1 ORDER BY batch_name, position",
-                )?;
+                     FROM batch_cases WHERE run_id = ?1 AND {CURRENT_GENERATION}
+                     ORDER BY batch_name, position"
+                ))?;
                 let rows = stmt.query_map(params![req.run_id], case_from_row)?;
                 let mut body = String::new();
                 for row in rows {
@@ -782,6 +852,14 @@ impl SqliteStore {
 
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
+        // Legacy schema keyed batch_cases by user-supplied case_id; rename it aside so the
+        // content-addressed table can be created, then carry rows over below.
+        let legacy_batch_cases: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('batch_cases') WHERE name = 'case_id'")?
+            .exists([])?;
+        if legacy_batch_cases {
+            conn.execute_batch("ALTER TABLE batch_cases RENAME TO batch_cases_legacy;")?;
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
@@ -839,12 +917,19 @@ impl SqliteStore {
                 valid INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS batches (
+                run_id TEXT NOT NULL,
+                batch_name TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                PRIMARY KEY (run_id, batch_name)
+            );
             CREATE TABLE IF NOT EXISTS batch_cases (
                 run_id TEXT NOT NULL,
                 batch_name TEXT NOT NULL,
-                case_id TEXT NOT NULL,
-                position INTEGER NOT NULL,
                 input_digest TEXT NOT NULL,
+                label TEXT,
+                position INTEGER NOT NULL,
+                generation INTEGER NOT NULL DEFAULT 1,
                 input_json TEXT NOT NULL,
                 status TEXT NOT NULL,
                 attempt INTEGER NOT NULL,
@@ -854,7 +939,15 @@ impl SqliteStore {
                 completed_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY (run_id, batch_name, case_id)
+                PRIMARY KEY (run_id, batch_name, input_digest)
+            );
+            CREATE TABLE IF NOT EXISTS memos (
+                run_id TEXT NOT NULL,
+                key_digest TEXT NOT NULL,
+                key_json TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, key_digest)
             );
             CREATE TABLE IF NOT EXISTS variants (
                 run_id TEXT NOT NULL,
@@ -894,6 +987,21 @@ impl SqliteStore {
                 timestamp TEXT NOT NULL
             );",
         )?;
+        if legacy_batch_cases {
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO batch_cases
+                   (run_id, batch_name, input_digest, label, position, generation, input_json,
+                    status, attempt, output_json, error_json, started_at, completed_at,
+                    created_at, updated_at)
+                 SELECT run_id, batch_name, input_digest, case_id, position, 1, input_json,
+                        status, attempt, output_json, error_json, started_at, completed_at,
+                        created_at, updated_at
+                 FROM batch_cases_legacy ORDER BY position;
+                 INSERT OR IGNORE INTO batches (run_id, batch_name, generation)
+                 SELECT DISTINCT run_id, batch_name, 1 FROM batch_cases_legacy;
+                 DROP TABLE batch_cases_legacy;",
+            )?;
+        }
         Ok(())
     }
 }
@@ -902,8 +1010,8 @@ fn case_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaseRecord> {
     Ok(CaseRecord {
         run_id: row.get(0)?,
         batch_name: row.get(1)?,
-        case_id: row.get(2)?,
-        input_digest: row.get(3)?,
+        input_digest: row.get(2)?,
+        label: row.get(3)?,
         status: row.get(4)?,
         attempt: row.get(5)?,
         input: parse_required(row.get::<_, String>(6)?)?,
@@ -1068,27 +1176,94 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn duplicate_batch_case_ids_are_rejected() {
-        let store = store();
-        let err = store
+    fn case(digest: &str, input: Value) -> BatchCaseInput {
+        BatchCaseInput {
+            input_digest: digest.to_string(),
+            input,
+            label: None,
+        }
+    }
+
+    fn register(store: &SqliteStore, cases: Vec<BatchCaseInput>) -> BatchSummary {
+        store
             .register_batch(RegisterBatchRequest {
                 run_id: "run".to_string(),
                 batch_name: "batch".to_string(),
-                cases: vec![
-                    BatchCaseInput {
-                        case_id: "case".to_string(),
-                        input_digest: "a".to_string(),
-                        input: json!({}),
-                    },
-                    BatchCaseInput {
-                        case_id: "case".to_string(),
-                        input_digest: "b".to_string(),
-                        input: json!({}),
-                    },
-                ],
+                cases,
             })
-            .expect_err("duplicate ids should fail");
-        assert!(matches!(err, Error::DuplicateCaseId(_)));
+            .expect("register batch")
+    }
+
+    #[test]
+    fn identical_inputs_collapse_to_one_case() {
+        let store = store();
+        let summary = register(
+            &store,
+            vec![case("a", json!({"x": 1})), case("a", json!({"x": 1}))],
+        );
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.pending, 1);
+    }
+
+    #[test]
+    fn changed_input_invalidates_and_revert_reuses_output() {
+        let store = store();
+        register(&store, vec![case("a", json!({"x": 1}))]);
+        store
+            .complete_case(CompleteCaseRequest {
+                run_id: "run".to_string(),
+                batch_name: "batch".to_string(),
+                input_digest: "a".to_string(),
+                output: json!({"ok": true}),
+            })
+            .expect("complete case");
+
+        // Edited input gets a fresh pending case; the stale success no longer counts.
+        let summary = register(&store, vec![case("b", json!({"x": 2}))]);
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.succeeded, 0);
+
+        // Reverting to the original input salvages its completed output.
+        let summary = register(&store, vec![case("a", json!({"x": 1}))]);
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.succeeded, 1);
+        let cases = store
+            .list_cases(ListCasesRequest {
+                run_id: "run".to_string(),
+                batch_name: "batch".to_string(),
+                statuses: vec![],
+            })
+            .expect("list cases");
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].output, Some(json!({"ok": true})));
+    }
+
+    #[test]
+    fn memo_roundtrip() {
+        let store = store();
+        let miss = store
+            .memo_get(MemoGetRequest {
+                run_id: "run".to_string(),
+                key_digest: "k".to_string(),
+            })
+            .expect("memo get miss");
+        assert!(!miss.found);
+        store
+            .memo_put(MemoPutRequest {
+                run_id: "run".to_string(),
+                key_digest: "k".to_string(),
+                key: json!({"turn": 1}),
+                value: json!({"answer": 42}),
+            })
+            .expect("memo put");
+        let hit = store
+            .memo_get(MemoGetRequest {
+                run_id: "run".to_string(),
+                key_digest: "k".to_string(),
+            })
+            .expect("memo get hit");
+        assert!(hit.found);
+        assert_eq!(hit.value, Some(json!({"answer": 42})));
     }
 }

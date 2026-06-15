@@ -89,6 +89,14 @@ impl Runtime {
         self.store.list_trace_events(run_id, batch_name, case_id)
     }
 
+    pub fn memo_get(&self, req: MemoGetRequest) -> crate::sqlite::Result<MemoGetResponse> {
+        self.store.memo_get(req)
+    }
+
+    pub fn memo_put(&self, req: MemoPutRequest) -> crate::sqlite::Result<()> {
+        self.store.memo_put(req)
+    }
+
     pub fn mark_reviewed(&self, req: ReviewRequest) -> crate::sqlite::Result<ReviewRecord> {
         self.store.mark_reviewed(req)
     }
