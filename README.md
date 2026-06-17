@@ -1,5 +1,7 @@
 # Durable Evals
 
+> 🚧 WIP
+
 A durable eval harness for performing long-running evals, recovering gracefully from intermittent or transient errors.
 
 Cases are content-addressed: a case's identity is the hash of its input. Re-running
