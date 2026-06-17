@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rmdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -32,9 +32,12 @@ export interface Runtime {
 
 export class RuntimeClient implements Runtime {
   readonly baseUrl: string;
+  private readonly headers: Record<string, string>;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
+    const token = process.env.DURABLE_EVALS_TOKEN;
+    this.headers = token ? { authorization: `Bearer ${token}` } : {};
   }
 
   static async ensureStarted(storageDir = ".durable"): Promise<RuntimeClient> {
@@ -45,6 +48,25 @@ export class RuntimeClient implements Runtime {
 
     await mkdir(storageDir, { recursive: true });
     const metadataPath = join(storageDir, "runtime.json");
+    const existing = await RuntimeClient.healthyFromMetadata(metadataPath);
+    if (existing) {
+      return existing;
+    }
+
+    // Serialize startup so concurrent first-runs don't each spawn a server against the
+    // same SQLite file; the winner writes runtime.json and the rest reuse it.
+    return await withStartupLock(storageDir, async () => {
+      const cached = await RuntimeClient.healthyFromMetadata(metadataPath);
+      if (cached) {
+        return cached;
+      }
+      return await RuntimeClient.spawn(storageDir, metadataPath);
+    });
+  }
+
+  private static async healthyFromMetadata(
+    metadataPath: string,
+  ): Promise<RuntimeClient | null> {
     const cached = await readRuntimeMetadata(metadataPath);
     if (cached?.url) {
       const client = new RuntimeClient(cached.url);
@@ -52,7 +74,13 @@ export class RuntimeClient implements Runtime {
         return client;
       }
     }
+    return null;
+  }
 
+  private static async spawn(
+    storageDir: string,
+    metadataPath: string,
+  ): Promise<RuntimeClient> {
     const serverBin =
       process.env.DURABLE_EVALS_SERVER_BIN ?? "durable-evals-server";
     const dbPath = join(storageDir, "evals.sqlite");
@@ -83,6 +111,7 @@ export class RuntimeClient implements Runtime {
   async isHealthy(): Promise<boolean> {
     try {
       const response = await fetch(`${this.baseUrl}/health`, {
+        headers: this.headers,
         signal: AbortSignal.timeout(200),
       });
       const body = (await response.json()) as { ok?: unknown };
@@ -173,7 +202,7 @@ export class RuntimeClient implements Runtime {
   ): Promise<unknown> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...this.headers },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(30000),
     });
@@ -184,6 +213,49 @@ export class RuntimeClient implements Runtime {
       );
     }
     return body;
+  }
+}
+
+async function withStartupLock<T>(
+  storageDir: string,
+  fn: () => Promise<T>,
+  { timeoutMs = 10000, staleMs = 30000 }: { timeoutMs?: number; staleMs?: number } = {},
+): Promise<T> {
+  const lockDir = join(storageDir, "runtime.lock");
+  const deadline = Date.now() + timeoutMs;
+  let acquired = false;
+  for (;;) {
+    try {
+      await mkdir(lockDir); // non-recursive: throws EEXIST when another holder exists
+      acquired = true;
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+      let age = 0;
+      try {
+        age = Date.now() - (await stat(lockDir)).mtimeMs;
+      } catch {
+        age = 0;
+      }
+      if (age > staleMs) {
+        // Reclaim a lock orphaned by a crashed process.
+        await rmdir(lockDir).catch(() => {});
+        continue;
+      }
+      if (Date.now() > deadline) {
+        break; // proceed without the lock rather than hang forever
+      }
+      await sleep(50);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    if (acquired) {
+      await rmdir(lockDir).catch(() => {});
+    }
   }
 }
 

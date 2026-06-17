@@ -357,24 +357,27 @@ test("batch fills duplicate positions from resumed succeeded cases", async () =>
   assert.equal(calls, 1);
 });
 
-test("batch records callback failures", async () => {
+test("batch records callback failures and continues", async () => {
   const runtime = new Runtime();
   const evalRun = new DurableEval({ runId: "run", runtime });
 
-  await assert.rejects(
-    evalRun.batch("cases", [{ id: "case" }]).map({
-      id: (testCase) => testCase.id,
-      run: () => {
-        throw new TypeError("bad");
-      },
-    }),
-    /bad/,
-  );
+  // A failing case is recorded durably and leaves its slot empty rather than
+  // aborting the whole batch.
+  const results = await evalRun.batch("cases", [{ id: "case" }]).map({
+    id: (testCase) => testCase.id,
+    run: () => {
+      throw new TypeError("bad");
+    },
+    maxAttempts: 5,
+  });
 
+  assert.equal(results.length, 1);
+  assert.equal(results[0], undefined);
   assert.equal(
     (runtime.failed.at(-1)?.error as { failure_class?: string }).failure_class,
     "user_code_error",
   );
+  assert.equal(runtime.failed.at(-1)?.max_attempts, 5);
 });
 
 test("memo caches values by key digest", async () => {

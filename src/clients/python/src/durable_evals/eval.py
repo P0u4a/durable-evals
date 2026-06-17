@@ -154,6 +154,7 @@ class Batch:
         id: Callable[[Any], str] | None = None,
         concurrency: int = 1,
         progress: Callable[[dict[str, int]], None] | None = None,
+        max_attempts: int = 3,
     ) -> list[Any]:
         records = self._register(id)
         outputs: list[Any] = [None] * len(self.cases)
@@ -169,13 +170,15 @@ class Batch:
 
         if concurrency <= 1:
             for item in runnable:
-                self._run_one(item, run, outputs, progress)
+                self._run_one(item, run, outputs, progress, max_attempts)
         else:
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
                 futures = [
-                    executor.submit(self._run_one, item, run, outputs, progress)
+                    executor.submit(self._run_one, item, run, outputs, progress, max_attempts)
                     for item in runnable
                 ]
+                # Surfacing the first exception would abort sibling cases; a failing case
+                # is already recorded durably, so let the batch run to completion.
                 for future in as_completed(futures):
                     future.result()
         return outputs
@@ -187,8 +190,9 @@ class Batch:
         id: Callable[[Any], str] | None = None,
         concurrency: int = 10,
         progress: Callable[[dict[str, int]], None] | None = None,
+        max_attempts: int = 3,
     ) -> list[Any]:
-        records = self._register(id)
+        records = await self._aregister(id)
         outputs: list[Any] = [None] * len(self.cases)
         semaphore = asyncio.Semaphore(concurrency)
         by_digest = {record["input_digest"]: record for record in records}
@@ -200,15 +204,17 @@ class Batch:
                     if inspect.isawaitable(result):
                         result = await result
                 except Exception as exc:
+                    # Record and move on so one bad case doesn't cancel the batch.
                     await self.eval._runtime.afail_case(
                         {
                             "run_id": self.eval.run_id,
                             "batch_name": self.batch_name,
                             "input_digest": record["input_digest"],
                             "error": _error_payload(exc),
+                            "max_attempts": max_attempts,
                         }
                     )
-                    raise
+                    return
                 await self.eval._runtime.acomplete_case(
                     {
                         "run_id": self.eval.run_id,
@@ -220,7 +226,7 @@ class Batch:
                 for index in indexes:
                     outputs[index] = result
                 if progress:
-                    progress(self.summary())
+                    progress(await self._asummary())
 
         tasks = []
         for digest, indexes in self._positions().items():
@@ -235,9 +241,21 @@ class Batch:
         return outputs
 
     def summary(self) -> dict[str, int]:
-        records = self.eval._runtime.list_cases(
-            {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": []}
+        return self._counts(
+            self.eval._runtime.list_cases(
+                {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": []}
+            )
         )
+
+    async def _asummary(self) -> dict[str, int]:
+        return self._counts(
+            await self.eval._runtime.alist_cases(
+                {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": []}
+            )
+        )
+
+    @staticmethod
+    def _counts(records: list[dict[str, Any]]) -> dict[str, int]:
         counts = {status: 0 for status in ["pending", "running", "succeeded", "failed", "terminal"]}
         for record in records:
             counts[record["status"]] = counts.get(record["status"], 0) + 1
@@ -264,8 +282,8 @@ class Batch:
             positions.setdefault(_json_digest(case), []).append(index)
         return positions
 
-    def _register(self, id: Callable[[Any], str] | None) -> list[dict[str, Any]]:
-        case_payloads = [
+    def _case_payloads(self, id: Callable[[Any], str] | None) -> list[dict[str, Any]]:
+        return [
             {
                 "input_digest": _json_digest(case),
                 "input": case,
@@ -273,14 +291,28 @@ class Batch:
             }
             for case in self.cases
         ]
+
+    def _register(self, id: Callable[[Any], str] | None) -> list[dict[str, Any]]:
         self.eval._runtime.register_batch(
             {
                 "run_id": self.eval.run_id,
                 "batch_name": self.batch_name,
-                "cases": case_payloads,
+                "cases": self._case_payloads(id),
             }
         )
         return self.eval._runtime.list_cases(
+            {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": []}
+        )
+
+    async def _aregister(self, id: Callable[[Any], str] | None) -> list[dict[str, Any]]:
+        await self.eval._runtime.aregister_batch(
+            {
+                "run_id": self.eval.run_id,
+                "batch_name": self.batch_name,
+                "cases": self._case_payloads(id),
+            }
+        )
+        return await self.eval._runtime.alist_cases(
             {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": []}
         )
 
@@ -290,24 +322,27 @@ class Batch:
         run: Callable[[Any], Any],
         outputs: list[Any],
         progress: Callable[[dict[str, int]], None] | None,
+        max_attempts: int,
     ) -> None:
         indexes, case, record = item
         try:
             result = run(case)
-            if inspect.isawaitable(result):
-                if inspect.iscoroutine(result):
-                    result.close()
-                raise TypeError("sync batch callback returned an awaitable")
         except Exception as exc:
+            # Record and move on so one bad case doesn't abort the batch.
             self.eval._runtime.fail_case(
                 {
                     "run_id": self.eval.run_id,
                     "batch_name": self.batch_name,
                     "input_digest": record["input_digest"],
                     "error": _error_payload(exc),
+                    "max_attempts": max_attempts,
                 }
             )
-            raise
+            return
+        if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
+                result.close()
+            raise TypeError("sync batch callback returned an awaitable")
         self.eval._runtime.complete_case(
             {
                 "run_id": self.eval.run_id,

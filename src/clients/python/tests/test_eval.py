@@ -59,6 +59,15 @@ class Runtime:
     def fail_case(self, payload):
         self.failed.append(payload)
 
+    async def aregister_batch(self, payload):
+        return self.register_batch(payload)
+
+    async def alist_cases(self, payload):
+        return self.list_cases(payload)
+
+    async def asummary(self, payload):
+        return self.summary(payload)
+
     async def acomplete_case(self, payload):
         self.complete_case(payload)
 
@@ -180,17 +189,21 @@ def test_batch_map_resumes_succeeded_cases_without_rerunning():
     assert rerun == []
 
 
-def test_batch_records_callback_failures():
+def test_batch_records_callback_failures_and_continues():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
 
-    with pytest.raises(ValueError, match="bad"):
-        eval_run.batch("cases", [{"id": "case"}]).map(
-            run=lambda _case: (_ for _ in ()).throw(ValueError("bad")),
-        )
+    # A failing case is recorded durably and leaves its slot empty rather than
+    # aborting the whole batch.
+    results = eval_run.batch("cases", [{"id": "case"}]).map(
+        run=lambda _case: (_ for _ in ()).throw(ValueError("bad")),
+        max_attempts=5,
+    )
 
+    assert results == [None]
     assert runtime.failed[0]["error"]["failure_class"] == "user_code_error"
     assert runtime.failed[0]["input_digest"] == _json_digest({"id": "case"})
+    assert runtime.failed[0]["max_attempts"] == 5
 
 
 def test_memo_returns_cached_value_without_recomputing():

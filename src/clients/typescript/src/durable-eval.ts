@@ -247,6 +247,7 @@ export class Batch<TCase> {
     id?: (testCase: TCase) => string;
     concurrency?: number;
     progress?: (summary: Record<string, number>) => void;
+    maxAttempts?: number;
   }): Promise<TOutput[]> {
     const runtime = await this.runtime();
     const records = await this.register(options.id);
@@ -281,6 +282,7 @@ export class Batch<TCase> {
     }
     let cursor = 0;
     const concurrency = options.concurrency ?? 1;
+    const maxAttempts = options.maxAttempts ?? 3;
 
     const worker = async (): Promise<void> => {
       while (cursor < runnable.length) {
@@ -300,13 +302,15 @@ export class Batch<TCase> {
           }
           options.progress?.(await this.summary());
         } catch (error) {
+          // Record the failure durably and keep going; aborting here would cancel
+          // sibling cases that are still running.
           await runtime.failCase!({
             run_id: this.evalRun.runId,
             batch_name: this.batchName,
             input_digest: digest,
             error: errorPayload(error),
+            max_attempts: maxAttempts,
           });
-          throw error;
         }
       }
     };
@@ -477,8 +481,8 @@ function digestJson(value: unknown): string {
     .digest("hex");
 }
 
-// Digests must match the Python client byte-for-byte (sorted keys, compact, UTF-8)
-// so the same logical input has the same identity from either client.
+// Canonical form (sorted keys, compact, UTF-8) so object key order doesn't change
+// a value's identity across runs.
 function canonicalJson(value: unknown, label: string): string {
   try {
     const json = JSON.stringify(value, (_key, val: unknown) =>
