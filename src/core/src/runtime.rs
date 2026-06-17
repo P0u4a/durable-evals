@@ -35,10 +35,6 @@ impl Runtime {
         self.store.register_batch(req)
     }
 
-    pub fn start_case(&self, req: ListCasesRequest) -> Result<Option<CaseRecord>> {
-        self.store.start_case(req)
-    }
-
     pub fn complete_case(&self, req: CompleteCaseRequest) -> Result<()> {
         self.store.complete_case(req)
     }
@@ -70,7 +66,7 @@ impl Runtime {
         self.store.list_workers()
     }
 
-    pub fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<()> {
+    pub fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
         self.store.heartbeat_step(req)
     }
 

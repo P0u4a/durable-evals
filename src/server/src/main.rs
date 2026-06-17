@@ -1,7 +1,10 @@
 use std::env;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use durable_evals_core::{Error as StoreError, *};
@@ -12,6 +15,13 @@ async fn main() -> anyhow::Result<()> {
 
     let db = env::var("DURABLE_EVALS_DB").unwrap_or_else(|_| ".durable/evals.sqlite".into());
     let runtime = build_runtime(&db)?;
+    // Optional shared-secret auth. Unset (the default) leaves the API open, which is fine
+    // for the loopback-bound local runtime but should be set whenever DURABLE_EVALS_ADDR
+    // exposes the server beyond localhost.
+    let token = env::var("DURABLE_EVALS_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(Arc::new);
     let app = Router::new()
         .route("/health", get(health))
         .route("/runs/register", post(register_run))
@@ -22,7 +32,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/steps/fail", post(fail_step))
         .route("/steps/heartbeat", post(heartbeat_step))
         .route("/batches/register", post(register_batch))
-        .route("/batches/cases/start", post(start_case))
         .route("/batches/cases/list", post(list_cases))
         .route("/batches/cases/complete", post(complete_case))
         .route("/batches/cases/fail", post(fail_case))
@@ -38,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/memos/get", post(memo_get))
         .route("/memos/put", post(memo_put))
         .route("/reviews", post(mark_reviewed))
+        .layer(middleware::from_fn_with_state(token, require_token))
         .with_state(runtime);
 
     let addr: SocketAddr = env::var("DURABLE_EVALS_ADDR")
@@ -49,6 +59,38 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Reject requests without a matching `Authorization: Bearer <token>` when a token is
+/// configured. `/health` stays open so liveness probes don't need the secret.
+async fn require_token(
+    State(token): State<Option<Arc<String>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(expected) = token.as_deref() {
+        if req.uri().path() != "/health" {
+            let provided = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "));
+            if provided != Some(expected.as_str()) {
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    Json(ErrorInfo {
+                        error_type: "Unauthorized".to_string(),
+                        message: "missing or invalid bearer token".to_string(),
+                        failure_class: FailureClass::RunnerError,
+                        stack: None,
+                        retryable: Some(false),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
 }
 
 fn build_runtime(db: &str) -> anyhow::Result<Runtime> {
@@ -119,7 +161,7 @@ async fn heartbeat_step(
 ) -> Result<Json<Health>, (axum::http::StatusCode, Json<ErrorInfo>)> {
     runtime
         .heartbeat_step(req)
-        .map(|_| Json(Health { ok: true }))
+        .map(|retained| Json(Health { ok: retained }))
         .map_err(store_error)
 }
 
@@ -128,13 +170,6 @@ async fn register_batch(
     Json(req): Json<RegisterBatchRequest>,
 ) -> Result<Json<BatchSummary>, (axum::http::StatusCode, Json<ErrorInfo>)> {
     runtime.register_batch(req).map(Json).map_err(store_error)
-}
-
-async fn start_case(
-    State(runtime): State<Runtime>,
-    Json(req): Json<ListCasesRequest>,
-) -> Result<Json<Option<CaseRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime.start_case(req).map(Json).map_err(store_error)
 }
 
 async fn list_cases(

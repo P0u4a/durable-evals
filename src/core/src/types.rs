@@ -84,6 +84,12 @@ pub struct FailCaseRequest {
     pub batch_name: String,
     pub input_digest: String,
     pub error: ErrorInfo,
+    #[serde(default = "default_case_max_attempts")]
+    pub max_attempts: u32,
+}
+
+fn default_case_max_attempts() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +152,30 @@ impl Default for RetryPolicy {
             retryable: default_retryable_classes(),
             terminal: default_terminal_classes(),
         }
+    }
+}
+
+impl RetryPolicy {
+    /// Delay in milliseconds before a failed step on `attempt` (1-based) may retry.
+    /// Exponential backoff `base_delay_ms * 2^(attempt-1)`, capped at `max_delay_ms`,
+    /// with optional jitter in `[0.5, 1.0)` derived from `jitter_seed` so we avoid
+    /// pulling in a random-number dependency. Returns 0 when no base delay is set,
+    /// preserving the previous immediate-retry behavior.
+    pub fn backoff_delay_ms(&self, attempt: u32, jitter_seed: u64) -> u64 {
+        if self.base_delay_ms == 0 {
+            return 0;
+        }
+        let exp = attempt.saturating_sub(1).min(32);
+        let mut delay = self.base_delay_ms.saturating_mul(1u64 << exp);
+        if self.max_delay_ms > 0 {
+            delay = delay.min(self.max_delay_ms);
+        }
+        if self.jitter && delay > 0 {
+            // Map the seed to a fraction in [0.5, 1.0) and scale the delay.
+            let frac = 0.5 + ((jitter_seed % 1000) as f64 / 1000.0) * 0.5;
+            delay = ((delay as f64) * frac) as u64;
+        }
+        delay
     }
 }
 

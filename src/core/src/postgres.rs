@@ -78,6 +78,7 @@ impl PostgresStore {
                 lease_acquired_at TIMESTAMPTZ,
                 lease_expires_at TIMESTAMPTZ,
                 heartbeat_at TIMESTAMPTZ,
+                retry_at TIMESTAMPTZ,
                 started_at TIMESTAMPTZ,
                 completed_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ NOT NULL,
@@ -178,7 +179,15 @@ impl PostgresStore {
                 decision TEXT NOT NULL,
                 note TEXT,
                 timestamp TIMESTAMPTZ NOT NULL
-            );",
+            );
+            ALTER TABLE step_states ADD COLUMN IF NOT EXISTS retry_at TIMESTAMPTZ;
+            CREATE INDEX IF NOT EXISTS idx_failure_records_run ON failure_records (run_id);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts (run_id);
+            CREATE INDEX IF NOT EXISTS idx_trace_events_case
+                ON trace_events (run_id, batch_name, case_id, attempt, event_index);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_trace_events_index
+                ON trace_events (run_id, batch_name, case_id, attempt, event_index);
+            CREATE INDEX IF NOT EXISTS idx_reviews_run ON reviews (run_id);",
         )?;
         Ok(())
     }
@@ -208,12 +217,19 @@ impl PostgresStore {
         let worker_id = req.worker_id.clone();
         let lease_seconds = i32::try_from(req.lease_seconds.unwrap_or(300)).unwrap_or(i32::MAX);
         let mut client = self.pool.get()?;
-        let existing = client
+        // Lock the row for the duration of the decision so two workers can't both claim
+        // the same step. The transaction + FOR UPDATE is what preserves single-flight
+        // ("in_progress") across processes.
+        let mut tx = client.transaction()?;
+        let existing = tx
             .query_opt(
                 "SELECT status, attempt, output_json, error_json,
-                        (lease_expires_at > now()) AS lease_active
+                        (lease_expires_at > now()) AS lease_active,
+                        (retry_at IS NOT NULL AND retry_at > now()) AS retry_pending,
+                        to_char(retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"+00:00\"') AS retry_at
                  FROM step_states
-                 WHERE run_id = $1 AND step_name = $2 AND input_digest = $3",
+                 WHERE run_id = $1 AND step_name = $2 AND input_digest = $3
+                 FOR UPDATE",
                 &[&req.run_id, &req.step_name, &req.input_digest],
             )?
             .map(|row| {
@@ -223,16 +239,18 @@ impl PostgresStore {
                     row.get::<_, Option<String>>(2),
                     row.get::<_, Option<String>>(3),
                     row.get::<_, Option<bool>>(4).unwrap_or(false),
+                    row.get::<_, Option<bool>>(5).unwrap_or(false),
+                    row.get::<_, Option<String>>(6),
                 )
             });
 
         match existing {
-            Some((status, _, output_json, _, _)) if status == "succeeded" => {
+            Some((status, _, output_json, _, _, _, _)) if status == "succeeded" => {
                 Ok(StepOutcome::SkipCompleted {
                     output: parse_optional(output_json)?.unwrap_or(Value::Null),
                 })
             }
-            Some((status, _, _, error_json, _)) if status == "terminal" => {
+            Some((status, _, _, error_json, _, _, _)) if status == "terminal" => {
                 Ok(StepOutcome::FailedTerminal {
                     error: parse_optional(error_json)?.unwrap_or(ErrorInfo {
                         error_type: "StepFailed".to_string(),
@@ -243,18 +261,19 @@ impl PostgresStore {
                     }),
                 })
             }
-            Some((status, _, _, _, lease_active))
+            Some((status, _, _, _, lease_active, _, _))
                 if status == "running" && lease_active =>
             {
                 Ok(StepOutcome::InProgress)
             }
-            Some((_, attempt, _, _, _)) if attempt >= req.retry.max_attempts => {
-                client.execute(
+            Some((_, attempt, _, _, _, _, _)) if attempt >= req.retry.max_attempts => {
+                tx.execute(
                     "UPDATE step_states
                      SET status = 'terminal', updated_at = now()
                      WHERE run_id = $1 AND step_name = $2 AND input_digest = $3",
                     &[&req.run_id, &req.step_name, &req.input_digest],
                 )?;
+                tx.commit()?;
                 Ok(StepOutcome::FailedTerminal {
                     error: ErrorInfo {
                         error_type: "MaxAttemptsExceeded".to_string(),
@@ -265,9 +284,16 @@ impl PostgresStore {
                     },
                 })
             }
-            Some((_, attempt, _, _, _)) => {
+            Some((status, _, _, _, _, retry_pending, retry_at))
+                if status == "failed" && retry_pending =>
+            {
+                Ok(StepOutcome::RetryLater {
+                    retry_at: retry_at.unwrap_or_else(now),
+                })
+            }
+            Some((_, attempt, _, _, _, _, _)) => {
                 let next_attempt = i64::from(attempt + 1);
-                client.execute(
+                tx.execute(
                     "UPDATE step_states
                      SET status = 'running',
                          attempt = $4,
@@ -279,6 +305,7 @@ impl PostgresStore {
                          lease_acquired_at = now(),
                          lease_expires_at = now() + make_interval(secs => $10::int),
                          heartbeat_at = now(),
+                         retry_at = NULL,
                          started_at = COALESCE(started_at, now()),
                          updated_at = now()
                      WHERE run_id = $1 AND step_name = $2 AND input_digest = $3",
@@ -295,19 +322,24 @@ impl PostgresStore {
                         &lease_seconds,
                     ],
                 )?;
+                tx.commit()?;
                 Ok(StepOutcome::Execute {
                     attempt: attempt + 1,
                 })
             }
             None => {
-                client.execute(
+                // No row to lock, so a concurrent worker could insert the same key first.
+                // ON CONFLICT DO NOTHING makes the loser observe 0 rows and back off as
+                // "in progress" rather than double-executing attempt 1.
+                let inserted = tx.execute(
                     "INSERT INTO step_states
                      (run_id, step_name, input_digest, status, attempt, config_json,
                       dependencies_json, variants_json, retry_json, lease_owner,
                       lease_acquired_at, lease_expires_at, heartbeat_at, started_at, updated_at)
                      VALUES ($1, $2, $3, 'running', 1, $4, $5, $6, $7, $8,
                              now(), now() + make_interval(secs => $9::int),
-                             now(), now(), now())",
+                             now(), now(), now())
+                     ON CONFLICT (run_id, step_name, input_digest) DO NOTHING",
                     &[
                         &req.run_id,
                         &req.step_name,
@@ -320,7 +352,12 @@ impl PostgresStore {
                         &lease_seconds,
                     ],
                 )?;
-                Ok(StepOutcome::Execute { attempt: 1 })
+                tx.commit()?;
+                if inserted == 0 {
+                    Ok(StepOutcome::InProgress)
+                } else {
+                    Ok(StepOutcome::Execute { attempt: 1 })
+                }
             }
         }
     }
@@ -398,9 +435,19 @@ impl PostgresStore {
         });
         let status = if retryable { "failed" } else { "terminal" };
         let error_json = serde_json::to_string(&req.error)?;
+        // Schedule the next eligible retry per the backoff policy; NULL means immediately.
+        let delay_secs: Option<i32> = if retryable {
+            let delay_ms = retry_policy.backoff_delay_ms(attempt as u32, jitter_seed());
+            let secs = delay_ms.div_ceil(1000);
+            (secs > 0).then(|| i32::try_from(secs).unwrap_or(i32::MAX))
+        } else {
+            None
+        };
         client.execute(
             "UPDATE step_states
              SET status = $4, error_json = $5, lease_owner = NULL, lease_expires_at = NULL,
+                 retry_at = CASE WHEN $6::int IS NULL THEN NULL
+                                 ELSE now() + make_interval(secs => $6::int) END,
                  completed_at = now(), updated_at = now()
              WHERE run_id = $1 AND step_name = $2 AND input_digest = $3",
             &[
@@ -409,6 +456,7 @@ impl PostgresStore {
                 &req.input_digest,
                 &status,
                 &error_json,
+                &delay_secs,
             ],
         )?;
         let failure_class = serde_json::to_string(&req.error.failure_class)?
@@ -482,46 +530,6 @@ impl PostgresStore {
         self.batch_summary(&req.run_id, &req.batch_name)
     }
 
-    fn start_case(&self, req: ListCasesRequest) -> Result<Option<CaseRecord>> {
-        let mut client = self.pool.get()?;
-        let record = client
-            .query_opt(
-                &format!(
-                    "SELECT run_id, batch_name, input_digest, label, status, attempt, input_json,
-                            output_json, error_json, {STARTED_AT}, {COMPLETED_AT}
-                     FROM batch_cases
-                     WHERE run_id = $1 AND batch_name = $2
-                       AND (cardinality($3::text[]) = 0 OR status = ANY($3::text[]))
-                       AND {CURRENT_GENERATION}
-                     ORDER BY position
-                     LIMIT 1",
-                    STARTED_AT = ts_text("started_at"),
-                    COMPLETED_AT = ts_text("completed_at"),
-                ),
-                &[&req.run_id, &req.batch_name, &req.statuses],
-            )?
-            .map(case_from_row)
-            .transpose()?;
-        if let Some(case) = record {
-            client.execute(
-                "UPDATE batch_cases
-                 SET status = 'running', attempt = attempt + 1,
-                     started_at = COALESCE(started_at, now()),
-                     updated_at = now()
-                 WHERE run_id = $1 AND batch_name = $2 AND input_digest = $3",
-                &[&case.run_id, &case.batch_name, &case.input_digest],
-            )?;
-            Ok(Some(CaseRecord {
-                status: "running".to_string(),
-                attempt: case.attempt + 1,
-                started_at: case.started_at.or_else(|| Some(now())),
-                ..case
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
     fn complete_case(&self, req: CompleteCaseRequest) -> Result<()> {
         let output_json = serde_json::to_string(&req.output)?;
         let mut client = self.pool.get()?;
@@ -545,18 +553,41 @@ impl PostgresStore {
                 | FailureClass::ResourceUnavailable
                 | FailureClass::UserCodeError
         ));
-        let status = if retryable { "failed" } else { "terminal" };
         let error_json = serde_json::to_string(&req.error)?;
         let mut client = self.pool.get()?;
-        let updated = client.execute(
+        let mut tx = client.transaction()?;
+        // Count this failed run as a consumed attempt and stop retrying at the ceiling.
+        let attempt = tx
+            .query_opt(
+                "SELECT attempt FROM batch_cases
+                 WHERE run_id = $1 AND batch_name = $2 AND input_digest = $3
+                 FOR UPDATE",
+                &[&req.run_id, &req.batch_name, &req.input_digest],
+            )?
+            .ok_or(Error::CaseNotFound)?
+            .get::<_, i64>(0);
+        let next_attempt = attempt + 1;
+        let exhausted = (next_attempt as u32) >= req.max_attempts;
+        let status = if retryable && !exhausted {
+            "failed"
+        } else {
+            "terminal"
+        };
+        tx.execute(
             "UPDATE batch_cases
-             SET status = $4, error_json = $5, completed_at = now(), updated_at = now()
+             SET status = $4, attempt = $5, error_json = $6,
+                 completed_at = now(), updated_at = now()
              WHERE run_id = $1 AND batch_name = $2 AND input_digest = $3",
-            &[&req.run_id, &req.batch_name, &req.input_digest, &status, &error_json],
+            &[
+                &req.run_id,
+                &req.batch_name,
+                &req.input_digest,
+                &status,
+                &next_attempt,
+                &error_json,
+            ],
         )?;
-        if updated == 0 {
-            return Err(Error::CaseNotFound);
-        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -686,13 +717,14 @@ impl PostgresStore {
             .collect()
     }
 
-    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<()> {
+    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
         let lease_seconds = i32::try_from(req.lease_seconds).unwrap_or(i32::MAX);
         let mut client = self.pool.get()?;
-        client.execute(
+        let updated = client.execute(
             "UPDATE step_states
              SET heartbeat_at = now(), lease_expires_at = now() + make_interval(secs => $5::int)
-             WHERE run_id = $1 AND step_name = $2 AND input_digest = $3 AND lease_owner = $4",
+             WHERE run_id = $1 AND step_name = $2 AND input_digest = $3 AND lease_owner = $4
+               AND status = 'running'",
             &[
                 &req.run_id,
                 &req.step_name,
@@ -701,15 +733,27 @@ impl PostgresStore {
                 &lease_seconds,
             ],
         )?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord> {
         let payload = serde_json::to_string(&req.payload)?;
         let artifact_ids = serde_json::to_string(&req.artifact_ids)?;
         let attempt = i64::from(req.attempt);
+        let lock_key = format!(
+            "{}/{}/{}/{}",
+            req.run_id, req.batch_name, req.case_id, attempt
+        );
         let mut client = self.pool.get()?;
-        let event_index: i64 = client
+        // Serialize index assignment per (case, attempt) with a transaction-scoped
+        // advisory lock so concurrent events can't collide on event_index. (FOR UPDATE
+        // is not valid on an aggregate query, so we lock explicitly instead.)
+        let mut tx = client.transaction()?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&lock_key],
+        )?;
+        let event_index: i64 = tx
             .query_one(
                 "SELECT COALESCE(MAX(event_index), 0) + 1
                  FROM trace_events
@@ -717,7 +761,7 @@ impl PostgresStore {
                 &[&req.run_id, &req.batch_name, &req.case_id, &attempt],
             )?
             .get(0);
-        let id: i64 = client
+        let id: i64 = tx
             .query_one(
                 "INSERT INTO trace_events
                  (run_id, batch_name, case_id, attempt, event_index, event_type,
@@ -736,6 +780,7 @@ impl PostgresStore {
                 ],
             )?
             .get(0);
+        tx.commit()?;
         Ok(TraceEventRecord {
             id,
             run_id: req.run_id,
@@ -925,17 +970,16 @@ impl PostgresStore {
                     "run_id,step_name,input_digest,attempt,failure_class,error_type,message,timestamp\n"
                         .to_string();
                 for failure in self.failure_records(&req.run_id)? {
-                    body.push_str(&format!(
-                        "{},{},{},{},{:?},{},{},{}\n",
-                        failure.run_id,
-                        failure.step_name,
-                        failure.input_digest,
-                        failure.attempt,
-                        failure.failure_class,
-                        failure.error_type,
-                        failure.message.replace(',', " "),
-                        failure.timestamp
-                    ));
+                    body.push_str(&csv_row([
+                        &failure.run_id,
+                        &failure.step_name,
+                        &failure.input_digest,
+                        &failure.attempt.to_string(),
+                        &format!("{:?}", failure.failure_class),
+                        &failure.error_type,
+                        &failure.message,
+                        &failure.timestamp,
+                    ]));
                 }
                 Ok(ExportResponse {
                     content_type: "text/csv".to_string(),
@@ -1027,9 +1071,6 @@ impl Store for PostgresStore {
     fn register_batch(&self, req: RegisterBatchRequest) -> Result<BatchSummary> {
         self.register_batch(req)
     }
-    fn start_case(&self, req: ListCasesRequest) -> Result<Option<CaseRecord>> {
-        self.start_case(req)
-    }
     fn complete_case(&self, req: CompleteCaseRequest) -> Result<()> {
         self.complete_case(req)
     }
@@ -1051,7 +1092,7 @@ impl Store for PostgresStore {
     fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
         self.list_workers()
     }
-    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<()> {
+    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
         self.heartbeat_step(req)
     }
     fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord> {
@@ -1149,6 +1190,32 @@ fn digest_bytes(bytes: &[u8]) -> String {
 
 fn now() -> String {
     Utc::now().to_rfc3339()
+}
+
+/// A monotonic-ish seed for retry jitter without taking on a random-number dependency.
+fn jitter_seed() -> u64 {
+    Utc::now().timestamp_subsec_nanos() as u64
+}
+
+fn csv_row<const N: usize>(fields: [&str; N]) -> String {
+    let mut line = String::with_capacity(64);
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        line.push_str(&csv_field(field));
+    }
+    line.push('\n');
+    line
+}
+
+/// Quote a CSV field per RFC 4180 when it contains a comma, quote, or newline.
+fn csv_field(value: &str) -> String {
+    if value.contains(|c| matches!(c, ',' | '"' | '\n' | '\r')) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 fn parse_failure_class(value: String) -> FailureClass {

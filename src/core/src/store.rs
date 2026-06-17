@@ -26,7 +26,6 @@ pub trait Store: Send + Sync + 'static {
     fn complete_step(&self, req: CompleteStepRequest) -> Result<()>;
     fn fail_step(&self, req: FailStepRequest) -> Result<()>;
     fn register_batch(&self, req: RegisterBatchRequest) -> Result<BatchSummary>;
-    fn start_case(&self, req: ListCasesRequest) -> Result<Option<CaseRecord>>;
     fn complete_case(&self, req: CompleteCaseRequest) -> Result<()>;
     fn fail_case(&self, req: FailCaseRequest) -> Result<()>;
     fn list_cases(&self, req: ListCasesRequest) -> Result<Vec<CaseRecord>>;
@@ -34,7 +33,9 @@ pub trait Store: Send + Sync + 'static {
     fn list_variants(&self, run_id: &str) -> Result<Vec<VariantRecord>>;
     fn register_worker(&self, req: RegisterWorkerRequest) -> Result<WorkerRecord>;
     fn list_workers(&self) -> Result<Vec<WorkerRecord>>;
-    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<()>;
+    /// Returns `true` if the heartbeat refreshed a lease still owned by the worker,
+    /// `false` if the lease was lost or the step no longer exists.
+    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool>;
     fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord>;
     fn list_trace_events(
         &self,

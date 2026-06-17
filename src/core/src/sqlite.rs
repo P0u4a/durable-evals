@@ -59,9 +59,13 @@ impl SqliteStore {
         let worker_id = req.worker_id.clone();
         let lease_seconds = req.lease_seconds.unwrap_or(300);
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let existing = conn
+        // The process-wide mutex serializes access for the single-process (default)
+        // deployment; the transaction keeps the read-modify-write atomic against the
+        // connection so a panic can't leave a half-applied state.
+        let tx = conn.unchecked_transaction()?;
+        let existing = tx
             .query_row(
-                "SELECT status, attempt, output_json, error_json, lease_expires_at
+                "SELECT status, attempt, output_json, error_json, lease_expires_at, retry_at
                  FROM step_states
                  WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
                 params![req.run_id, req.step_name, req.input_digest],
@@ -72,18 +76,19 @@ impl SqliteStore {
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
             .optional()?;
 
         match existing {
-            Some((status, _, output_json, _, _)) if status == "succeeded" => {
+            Some((status, _, output_json, _, _, _)) if status == "succeeded" => {
                 Ok(StepOutcome::SkipCompleted {
                     output: parse_optional(output_json)?.unwrap_or(Value::Null),
                 })
             }
-            Some((status, _, _, error_json, _)) if status == "terminal" => {
+            Some((status, _, _, error_json, _, _)) if status == "terminal" => {
                 Ok(StepOutcome::FailedTerminal {
                     error: parse_optional(error_json)?.unwrap_or(ErrorInfo {
                         error_type: "StepFailed".to_string(),
@@ -94,18 +99,19 @@ impl SqliteStore {
                     }),
                 })
             }
-            Some((status, _, _, _, lease_expires_at))
+            Some((status, _, _, _, lease_expires_at, _))
                 if status == "running" && lease_active(lease_expires_at.as_deref()) =>
             {
                 Ok(StepOutcome::InProgress)
             }
-            Some((_, attempt, _, _, _)) if attempt >= req.retry.max_attempts => {
-                conn.execute(
+            Some((_, attempt, _, _, _, _)) if attempt >= req.retry.max_attempts => {
+                tx.execute(
                     "UPDATE step_states
                      SET status = 'terminal', updated_at = datetime('now')
                      WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
                     params![req.run_id, req.step_name, req.input_digest],
                 )?;
+                tx.commit()?;
                 Ok(StepOutcome::FailedTerminal {
                     error: ErrorInfo {
                         error_type: "MaxAttemptsExceeded".to_string(),
@@ -116,9 +122,15 @@ impl SqliteStore {
                     },
                 })
             }
-            Some((_, attempt, _, _, _)) => {
+            // A failed step whose backoff window has not elapsed yet must wait.
+            Some((status, _, _, _, _, Some(retry_at)))
+                if status == "failed" && retry_pending(&retry_at) =>
+            {
+                Ok(StepOutcome::RetryLater { retry_at })
+            }
+            Some((_, attempt, _, _, _, _)) => {
                 let next_attempt = attempt + 1;
-                conn.execute(
+                tx.execute(
                     "UPDATE step_states
                      SET status = 'running',
                          attempt = ?4,
@@ -130,6 +142,7 @@ impl SqliteStore {
                          lease_acquired_at = datetime('now'),
                          lease_expires_at = datetime('now', '+' || ?10 || ' seconds'),
                          heartbeat_at = datetime('now'),
+                         retry_at = NULL,
                          started_at = COALESCE(started_at, datetime('now')),
                          updated_at = datetime('now')
                      WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
@@ -146,12 +159,13 @@ impl SqliteStore {
                         lease_seconds
                     ],
                 )?;
+                tx.commit()?;
                 Ok(StepOutcome::Execute {
                     attempt: next_attempt,
                 })
             }
             None => {
-                conn.execute(
+                tx.execute(
                     "INSERT INTO step_states
                      (run_id, step_name, input_digest, status, attempt, config_json,
                       dependencies_json, variants_json, retry_json, lease_owner,
@@ -171,6 +185,7 @@ impl SqliteStore {
                         lease_seconds
                     ],
                 )?;
+                tx.commit()?;
                 Ok(StepOutcome::Execute { attempt: 1 })
             }
         }
@@ -235,9 +250,18 @@ impl SqliteStore {
         });
         let status = if retryable { "failed" } else { "terminal" };
         let error_json = serde_json::to_string(&req.error)?;
+        // Schedule the next eligible retry per the backoff policy; 0 means retry immediately.
+        let delay_secs = retryable
+            .then(|| {
+                let delay_ms = retry_policy.backoff_delay_ms(attempt, jitter_seed());
+                delay_ms.div_ceil(1000)
+            })
+            .filter(|secs| *secs > 0);
         conn.execute(
             "UPDATE step_states
              SET status = ?4, error_json = ?5, lease_owner = NULL, lease_expires_at = NULL,
+                 retry_at = CASE WHEN ?6 IS NULL THEN NULL
+                                 ELSE datetime('now', '+' || ?6 || ' seconds') END,
                  completed_at = datetime('now'), updated_at = datetime('now')
              WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
             params![
@@ -245,7 +269,8 @@ impl SqliteStore {
                 req.step_name,
                 req.input_digest,
                 status,
-                error_json
+                error_json,
+                delay_secs
             ],
         )?;
         let failure_class = serde_json::to_string(&req.error.failure_class)?
@@ -317,48 +342,6 @@ impl SqliteStore {
         self.batch_summary(&req.run_id, &req.batch_name)
     }
 
-    pub fn start_case(&self, req: ListCasesRequest) -> Result<Option<CaseRecord>> {
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let record = conn
-            .query_row(
-                &format!(
-                    "SELECT run_id, batch_name, input_digest, label, status, attempt, input_json,
-                            output_json, error_json, started_at, completed_at
-                     FROM batch_cases
-                     WHERE run_id = ?1 AND batch_name = ?2
-                       AND (?3 = '[]' OR status IN (SELECT value FROM json_each(?3)))
-                       AND {CURRENT_GENERATION}
-                     ORDER BY position
-                     LIMIT 1"
-                ),
-                params![
-                    req.run_id,
-                    req.batch_name,
-                    serde_json::to_string(&req.statuses)?
-                ],
-                case_from_row,
-            )
-            .optional()?;
-        if let Some(case) = record {
-            conn.execute(
-                "UPDATE batch_cases
-                 SET status = 'running', attempt = attempt + 1,
-                     started_at = COALESCE(started_at, datetime('now')),
-                     updated_at = datetime('now')
-                 WHERE run_id = ?1 AND batch_name = ?2 AND input_digest = ?3",
-                params![case.run_id, case.batch_name, case.input_digest],
-            )?;
-            Ok(Some(CaseRecord {
-                status: "running".to_string(),
-                attempt: case.attempt + 1,
-                started_at: case.started_at.or_else(|| Some(now())),
-                ..case
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub fn complete_case(&self, req: CompleteCaseRequest) -> Result<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let updated = conn.execute(
@@ -386,23 +369,41 @@ impl SqliteStore {
                 | FailureClass::ResourceUnavailable
                 | FailureClass::UserCodeError
         ));
-        let status = if retryable { "failed" } else { "terminal" };
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let updated = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        // Count this failed run as a consumed attempt and stop retrying once the
+        // ceiling is reached, mirroring the step retry policy.
+        let attempt: u32 = tx
+            .query_row(
+                "SELECT attempt FROM batch_cases
+                 WHERE run_id = ?1 AND batch_name = ?2 AND input_digest = ?3",
+                params![req.run_id, req.batch_name, req.input_digest],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::CaseNotFound)?;
+        let next_attempt = attempt + 1;
+        let exhausted = next_attempt >= req.max_attempts;
+        let status = if retryable && !exhausted {
+            "failed"
+        } else {
+            "terminal"
+        };
+        tx.execute(
             "UPDATE batch_cases
-             SET status = ?4, error_json = ?5, completed_at = datetime('now'), updated_at = datetime('now')
+             SET status = ?4, attempt = ?5, error_json = ?6,
+                 completed_at = datetime('now'), updated_at = datetime('now')
              WHERE run_id = ?1 AND batch_name = ?2 AND input_digest = ?3",
             params![
                 req.run_id,
                 req.batch_name,
                 req.input_digest,
                 status,
+                next_attempt,
                 serde_json::to_string(&req.error)?
             ],
         )?;
-        if updated == 0 {
-            return Err(Error::CaseNotFound);
-        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -526,12 +527,13 @@ impl SqliteStore {
             .map_err(Error::Sqlite)
     }
 
-    pub fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<()> {
+    pub fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE step_states
              SET heartbeat_at = datetime('now'), lease_expires_at = datetime('now', '+' || ?5 || ' seconds')
-             WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3 AND lease_owner = ?4",
+             WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3 AND lease_owner = ?4
+               AND status = 'running'",
             params![
                 req.run_id,
                 req.step_name,
@@ -540,7 +542,7 @@ impl SqliteStore {
                 req.lease_seconds
             ],
         )?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     pub fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord> {
@@ -753,17 +755,16 @@ impl SqliteStore {
                     "run_id,step_name,input_digest,attempt,failure_class,error_type,message,timestamp\n"
                         .to_string();
                 for failure in self.failure_records(&req.run_id)? {
-                    body.push_str(&format!(
-                        "{},{},{},{},{:?},{},{},{}\n",
-                        failure.run_id,
-                        failure.step_name,
-                        failure.input_digest,
-                        failure.attempt,
-                        failure.failure_class,
-                        failure.error_type,
-                        failure.message.replace(',', " "),
-                        failure.timestamp
-                    ));
+                    body.push_str(&csv_row([
+                        &failure.run_id,
+                        &failure.step_name,
+                        &failure.input_digest,
+                        &failure.attempt.to_string(),
+                        &format!("{:?}", failure.failure_class),
+                        &failure.error_type,
+                        &failure.message,
+                        &failure.timestamp,
+                    ]));
                 }
                 Ok(ExportResponse {
                     content_type: "text/csv".to_string(),
@@ -872,6 +873,7 @@ impl SqliteStore {
                 lease_acquired_at TEXT,
                 lease_expires_at TEXT,
                 heartbeat_at TEXT,
+                retry_at TEXT,
                 started_at TEXT,
                 completed_at TEXT,
                 updated_at TEXT NOT NULL,
@@ -972,8 +974,22 @@ impl SqliteStore {
                 decision TEXT NOT NULL,
                 note TEXT,
                 timestamp TEXT NOT NULL
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS idx_failure_records_run ON failure_records (run_id);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts (run_id);
+            CREATE INDEX IF NOT EXISTS idx_trace_events_case
+                ON trace_events (run_id, batch_name, case_id, attempt, event_index);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_trace_events_index
+                ON trace_events (run_id, batch_name, case_id, attempt, event_index);
+            CREATE INDEX IF NOT EXISTS idx_reviews_run ON reviews (run_id);",
         )?;
+        // Older databases predate the retry_at backoff column; add it in place.
+        let has_retry_at: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('step_states') WHERE name = 'retry_at'")?
+            .exists([])?;
+        if !has_retry_at {
+            conn.execute_batch("ALTER TABLE step_states ADD COLUMN retry_at TEXT;")?;
+        }
         if legacy_batch_cases {
             conn.execute_batch(
                 "INSERT OR IGNORE INTO batch_cases
@@ -1009,9 +1025,6 @@ impl Store for SqliteStore {
     fn register_batch(&self, req: RegisterBatchRequest) -> Result<BatchSummary> {
         self.register_batch(req)
     }
-    fn start_case(&self, req: ListCasesRequest) -> Result<Option<CaseRecord>> {
-        self.start_case(req)
-    }
     fn complete_case(&self, req: CompleteCaseRequest) -> Result<()> {
         self.complete_case(req)
     }
@@ -1033,7 +1046,7 @@ impl Store for SqliteStore {
     fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
         self.list_workers()
     }
-    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<()> {
+    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
         self.heartbeat_step(req)
     }
     fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord> {
@@ -1120,19 +1133,54 @@ fn digest_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Matches SQLite's `datetime('now')` text format so values we synthesize in Rust
+/// (e.g. heartbeat timestamps returned to clients) read back identically to the ones
+/// the database wrote.
 fn now() -> String {
-    Utc::now().to_rfc3339()
+    Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Parse a `datetime('now')`-formatted timestamp and report whether it is still in
+/// the future relative to now.
+fn in_future(timestamp: &str) -> bool {
+    let normalized = format!("{}Z", timestamp.replace(' ', "T"));
+    chrono::DateTime::parse_from_rfc3339(&normalized)
+        .map(|dt| dt.with_timezone(&Utc) > Utc::now())
+        .unwrap_or(false)
 }
 
 fn lease_active(lease_expires_at: Option<&str>) -> bool {
-    lease_expires_at
-        .map(|expires| {
-            let sql = format!("{}Z", expires.replace(' ', "T"));
-            chrono::DateTime::parse_from_rfc3339(&sql)
-                .map(|dt| dt.with_timezone(&Utc) > Utc::now())
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
+    lease_expires_at.map(in_future).unwrap_or(false)
+}
+
+fn retry_pending(retry_at: &str) -> bool {
+    in_future(retry_at)
+}
+
+/// A monotonic-ish seed for retry jitter without taking on a random-number dependency.
+fn jitter_seed() -> u64 {
+    Utc::now().timestamp_subsec_nanos() as u64
+}
+
+fn csv_row<const N: usize>(fields: [&str; N]) -> String {
+    let mut line = String::with_capacity(64);
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        line.push_str(&csv_field(field));
+    }
+    line.push('\n');
+    line
+}
+
+/// Quote a CSV field per RFC 4180 when it contains a comma, quote, or newline.
+fn csv_field(value: &str) -> String {
+    if value.contains(|c| matches!(c, ',' | '"' | '\n' | '\r')) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
 }
 
 fn parse_failure_class(value: String) -> FailureClass {
@@ -1295,6 +1343,86 @@ mod tests {
             .expect("list cases");
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].output, Some(json!({"ok": true})));
+    }
+
+    fn fail_case_req(max_attempts: u32) -> FailCaseRequest {
+        FailCaseRequest {
+            run_id: "run".to_string(),
+            batch_name: "batch".to_string(),
+            input_digest: "a".to_string(),
+            error: ErrorInfo {
+                error_type: "RuntimeError".to_string(),
+                message: "boom".to_string(),
+                failure_class: FailureClass::Transient,
+                stack: None,
+                retryable: Some(true),
+            },
+            max_attempts,
+        }
+    }
+
+    #[test]
+    fn case_goes_terminal_after_max_attempts() {
+        let store = store();
+        register(&store, vec![case("a", json!({"x": 1}))]);
+
+        store.fail_case(fail_case_req(2)).expect("first failure");
+        let failed = store
+            .list_cases(ListCasesRequest {
+                run_id: "run".to_string(),
+                batch_name: "batch".to_string(),
+                statuses: vec!["failed".to_string()],
+            })
+            .expect("list failed");
+        assert_eq!(failed.len(), 1, "first failure stays retryable");
+        assert_eq!(failed[0].attempt, 1);
+
+        store.fail_case(fail_case_req(2)).expect("second failure");
+        let terminal = store
+            .list_cases(ListCasesRequest {
+                run_id: "run".to_string(),
+                batch_name: "batch".to_string(),
+                statuses: vec!["terminal".to_string()],
+            })
+            .expect("list terminal");
+        assert_eq!(terminal.len(), 1, "ceiling reached marks terminal");
+        assert_eq!(terminal[0].attempt, 2);
+    }
+
+    #[test]
+    fn failed_step_with_backoff_reports_retry_later() {
+        let store = store();
+        let mut req = begin_req();
+        req.retry = RetryPolicy {
+            max_attempts: 3,
+            base_delay_ms: 60_000,
+            ..RetryPolicy::default()
+        };
+        assert!(matches!(
+            store.begin_step(req.clone()).expect("begin step"),
+            StepOutcome::Execute { attempt: 1 }
+        ));
+        store
+            .fail_step(FailStepRequest {
+                run_id: "run".to_string(),
+                step_name: "step".to_string(),
+                input_digest: "digest".to_string(),
+                error: ErrorInfo {
+                    error_type: "RuntimeError".to_string(),
+                    message: "temporary failure".to_string(),
+                    failure_class: FailureClass::Transient,
+                    stack: None,
+                    retryable: Some(true),
+                },
+            })
+            .expect("mark step failed");
+        assert!(
+            matches!(
+                store.begin_step(req).expect("begin during backoff"),
+                StepOutcome::RetryLater { .. }
+            ),
+            "backoff window should defer the retry"
+        );
     }
 
     #[test]
