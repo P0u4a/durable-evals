@@ -4,11 +4,19 @@
 
 A durable eval harness for performing long-running evals, recovering gracefully from intermittent or transient errors.
 
-Cases are content-addressed: a case's identity is the hash of its input. Re-running
-a script reuses completed outputs, editing an input automatically invalidates just
-that case, and reverting the edit restores the original cached output. Identical
-inputs collapse to a single case (add e.g. a `sample` field to the input for
-repeated sampling). The optional `id` callback only provides a human-readable label.
+## What this is
+
+A problem when running evals on agents is if there's a upstream error during the eval, like an API request that returns a 500, or a write to a file that fails, the process hangs, and now you need to restart the whole eval. When cost is a concern, restarting the eval is expensive (api costs etc.).
+
+The goal of this library is to alleviate some of this pain by providing a mechanism for resuming evals from where they left off, and for automatically retrying upon transient errors.
+
+## How it works
+
+A case is a specific task in the eval. Cases are content-addressed: a case's identity is the hash of its input. Re-running a script reuses completed outputs, editing an input automatically invalidates just that case, and reverting the edit restores the original cached output. Identical
+inputs collapse to a single case (add e.g. a `sample` field to the input for repeated sampling). The optional `id` callback only provides a human-readable label.
+
+A step is a single unit of work that is part of an eval's method. For example, scoring is a step.
+
 
 ## Python
 
@@ -147,5 +155,17 @@ Useful environment variables:
 
 - `DURABLE_EVALS_RUNTIME_URL`: Connect to an existing runtime server.
 - `DURABLE_EVALS_SERVER_BIN`: Override the server binary path.
-- `DURABLE_EVALS_DB`: Set the SQLite database path for the server.
+- `DURABLE_EVALS_DB`: Set the SQLite database path for the server (a
+  `postgres://` / `postgresql://` URL selects the Postgres backend, which
+  requires building the server with the `postgres` feature).
 - `DURABLE_EVALS_ADDR`: Set the server bind address.
+- `DURABLE_EVALS_TOKEN`: Require `Authorization: Bearer <token>` on every
+  request except `/health`. Clients read the same variable and attach the
+  header automatically.
+
+### Security
+
+The server has no authentication by default and binds to `127.0.0.1:0`, so it is
+only reachable locally. If you point `DURABLE_EVALS_ADDR` at a non-loopback
+address, also set `DURABLE_EVALS_TOKEN` (and front it with TLS) — otherwise the
+mutating API is exposed unauthenticated.
