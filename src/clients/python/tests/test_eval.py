@@ -9,70 +9,70 @@ from durable_evals.eval import _json_digest
 class Runtime:
     def __init__(self):
         self.runs = []
-        self.cases = {}
+        self.tasks = {}
         self.completed = []
         self.failed = []
         self.variants_payload = None
         self.trace_events = []
-        self.reviews = []
         self.memos = {}
 
     def register_run(self, payload):
         self.runs.append(payload)
 
-    def register_batch(self, payload):
-        key = (payload["run_id"], payload["batch_name"])
-        records = self.cases.setdefault(key, [])
+    def register_dataset(self, payload):
+        key = (payload["run_id"], payload["dataset_name"])
+        records = self.tasks.setdefault(key, [])
         by_digest = {record["input_digest"]: record for record in records}
-        for case in payload["cases"]:
-            if case["input_digest"] in by_digest:
+        for task in payload["tasks"]:
+            if task["input_digest"] in by_digest:
                 continue
             record = {
                 "run_id": payload["run_id"],
-                "batch_name": payload["batch_name"],
-                "input_digest": case["input_digest"],
-                "label": case.get("label"),
+                "dataset_name": payload["dataset_name"],
+                "input_digest": task["input_digest"],
+                "label": task.get("label"),
+                "category": task.get("category"),
                 "status": "pending",
                 "attempt": 0,
-                "input": case["input"],
+                "input": task["input"],
                 "output": None,
                 "error": None,
             }
             records.append(record)
-            by_digest[case["input_digest"]] = record
+            by_digest[task["input_digest"]] = record
         return {"total": len(records)}
 
-    def list_cases(self, payload):
-        records = self.cases[(payload["run_id"], payload["batch_name"])]
+    def list_tasks(self, payload):
+        records = self.tasks[(payload["run_id"], payload["dataset_name"])]
         statuses = set(payload.get("statuses") or [])
         if statuses:
             return [record for record in records if record["status"] in statuses]
         return records
 
-    def complete_case(self, payload):
+    def complete_task(self, payload):
         self.completed.append(payload)
-        for record in self.cases[(payload["run_id"], payload["batch_name"])]:
+        for record in self.tasks[(payload["run_id"], payload["dataset_name"])]:
             if record["input_digest"] == payload["input_digest"]:
                 record["status"] = "succeeded"
                 record["output"] = payload["output"]
 
-    def fail_case(self, payload):
+    def fail_task(self, payload):
         self.failed.append(payload)
 
-    async def aregister_batch(self, payload):
-        return self.register_batch(payload)
+    async def aregister_dataset(self, payload):
+        return self.register_dataset(payload)
 
-    async def alist_cases(self, payload):
-        return self.list_cases(payload)
+    async def alist_tasks(self, payload):
+        return self.list_tasks(payload)
 
     async def asummary(self, payload):
         return self.summary(payload)
 
-    async def acomplete_case(self, payload):
-        self.complete_case(payload)
+    async def acomplete_task(self, payload):
+        self.complete_task(payload)
 
-    async def afail_case(self, payload):
-        self.fail_case(payload)
+    async def afail_task(self, payload):
+        self.fail_task(payload)
 
     def memo_get(self, payload):
         key = (payload["run_id"], payload["key_digest"])
@@ -94,16 +94,9 @@ class Runtime:
         self.variants_payload = payload
         return payload["variants"]
 
-    def register_worker(self, payload):
-        return {"worker_id": payload["worker_id"], "resources": payload["resources"]}
-
     def trace_event(self, payload):
         self.trace_events.append(payload)
         return {**payload, "event_index": len(self.trace_events)}
-
-    def mark_reviewed(self, payload):
-        self.reviews.append(payload)
-        return payload
 
     def summary(self, payload):
         return {"run_id": payload["run_id"]}
@@ -112,98 +105,120 @@ class Runtime:
         return {"body": "exported"}
 
 
-def test_batch_map_returns_results_in_input_order():
+def test_dataset_map_returns_results_in_input_order():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
-    cases = [{"id": "b"}, {"id": "a"}]
+    tasks = [{"id": "b"}, {"id": "a"}]
 
-    results = eval_run.batch("cases", cases).map(
-        run=lambda case: {"case_id": case["id"]},
-        id=lambda case: case["id"],
+    results = eval_run.dataset("tasks", tasks).map(
+        run=lambda task: {"task_id": task["id"]},
+        id=lambda task: task["id"],
     )
 
-    assert results == [{"case_id": "b"}, {"case_id": "a"}]
+    assert results == [{"task_id": "b"}, {"task_id": "a"}]
     assert [payload["input_digest"] for payload in runtime.completed] == [
-        _json_digest(case) for case in cases
+        _json_digest(task) for task in tasks
     ]
-    assert [record["label"] for record in runtime.cases[("run", "cases")]] == ["b", "a"]
+    assert [record["label"] for record in runtime.tasks[("run", "tasks")]] == ["b", "a"]
 
 
-def test_batch_map_works_without_id():
+def test_dataset_map_works_without_id():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
 
-    results = eval_run.batch("cases", [{"x": 1}, {"x": 2}]).map(run=lambda case: case["x"])
+    results = eval_run.dataset("tasks", [{"x": 1}, {"x": 2}]).map(run=lambda task: task["x"])
 
     assert results == [1, 2]
-    assert [record["label"] for record in runtime.cases[("run", "cases")]] == [None, None]
+    assert [record["label"] for record in runtime.tasks[("run", "tasks")]] == [None, None]
 
 
-def test_batch_map_runs_duplicate_inputs_once_and_fills_all_positions():
+def test_dataset_map_runs_duplicate_inputs_once_and_fills_all_positions():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
     calls = []
 
-    def run(case):
-        calls.append(case)
-        return case["x"] * 10
+    def run(task):
+        calls.append(task)
+        return task["x"] * 10
 
-    results = eval_run.batch("cases", [{"x": 1}, {"x": 2}, {"x": 1}]).map(run=run)
+    results = eval_run.dataset("tasks", [{"x": 1}, {"x": 2}, {"x": 1}]).map(run=run)
 
     assert results == [10, 20, 10]
     assert calls == [{"x": 1}, {"x": 2}]
-    assert len(runtime.cases[("run", "cases")]) == 2
+    assert len(runtime.tasks[("run", "tasks")]) == 2
 
 
-def test_batch_amap_runs_duplicate_inputs_once_and_fills_all_positions():
+def test_dataset_amap_runs_duplicate_inputs_once_and_fills_all_positions():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
     calls = []
 
-    async def run(case):
-        calls.append(case)
-        return case["x"] * 10
+    async def run(task):
+        calls.append(task)
+        return task["x"] * 10
 
     results = asyncio.run(
-        eval_run.batch("cases", [{"x": 1}, {"x": 2}, {"x": 1}]).amap(run=run)
+        eval_run.dataset("tasks", [{"x": 1}, {"x": 2}, {"x": 1}]).amap(run=run)
     )
 
     assert results == [10, 20, 10]
     assert calls == [{"x": 1}, {"x": 2}]
 
 
-def test_batch_map_resumes_succeeded_cases_without_rerunning():
+def test_dataset_map_resumes_succeeded_tasks_without_rerunning():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
-    eval_run.batch("cases", [{"x": 1}, {"x": 2}]).map(run=lambda case: case["x"])
+    eval_run.dataset("tasks", [{"x": 1}, {"x": 2}]).map(run=lambda task: task["x"])
 
     rerun = []
 
-    def run(case):
-        rerun.append(case)
-        return case["x"]
+    def run(task):
+        rerun.append(task)
+        return task["x"]
 
-    results = eval_run.batch("cases", [{"x": 1}, {"x": 2}]).map(run=run)
+    results = eval_run.dataset("tasks", [{"x": 1}, {"x": 2}]).map(run=run)
 
     assert results == [1, 2]
     assert rerun == []
 
 
-def test_batch_records_callback_failures_and_continues():
+def test_dataset_records_callback_failures_and_continues():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
 
-    # A failing case is recorded durably and leaves its slot empty rather than
-    # aborting the whole batch.
-    results = eval_run.batch("cases", [{"id": "case"}]).map(
-        run=lambda _case: (_ for _ in ()).throw(ValueError("bad")),
+    # A failing task is recorded durably and leaves its slot empty rather than
+    # aborting the whole dataset.
+    results = eval_run.dataset("tasks", [{"id": "task"}]).map(
+        run=lambda _task: (_ for _ in ()).throw(ValueError("bad")),
         max_attempts=5,
     )
 
     assert results == [None]
-    assert runtime.failed[0]["error"]["failure_class"] == "user_code_error"
-    assert runtime.failed[0]["input_digest"] == _json_digest({"id": "case"})
+    assert runtime.failed[0]["error"]["failure_class"] == "eval_exception"
+    assert runtime.failed[0]["input_digest"] == _json_digest({"id": "task"})
     assert runtime.failed[0]["max_attempts"] == 5
+
+
+def test_dataset_map_assigns_category_and_filters_by_categories():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+    ran = []
+
+    results = eval_run.dataset("tasks", [{"x": 1}, {"x": 2}, {"x": 3}]).map(
+        run=lambda task: ran.append(task["x"]) or task["x"],
+        category=lambda task: "even" if task["x"] % 2 == 0 else "odd",
+        categories=["even"],
+    )
+
+    # Categories are persisted at registration time for every task.
+    assert [record["category"] for record in runtime.tasks[("run", "tasks")]] == [
+        "odd",
+        "even",
+        "odd",
+    ]
+    # Only the "even" task is actually run; the rest stay pending/empty.
+    assert ran == [2]
+    assert results == [None, 2, None]
 
 
 def test_memo_returns_cached_value_without_recomputing():
@@ -249,41 +264,31 @@ def test_amemo_returns_cached_value_without_recomputing():
     assert len(calls) == 1
 
 
-def test_trace_case_and_mark_reviewed_accept_case_or_case_id():
+def test_trace_task_accepts_task_or_task_id():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
-    case = {"x": 1}
+    task = {"x": 1}
 
-    with eval_run.trace_case("cases", case=case) as trace:
+    with eval_run.trace_task("tasks", task=task) as trace:
         trace.model_request({"messages": []})
-    eval_run.mark_reviewed(batch_name="cases", case=case, decision="reviewed_pass")
 
-    assert runtime.trace_events[0]["case_id"] == _json_digest(case)
-    assert runtime.reviews[0]["case_id"] == _json_digest(case)
+    assert runtime.trace_events[0]["task_id"] == _json_digest(task)
 
     with pytest.raises(ValueError, match="exactly one"):
-        eval_run.trace_case("cases")
+        eval_run.trace_task("tasks")
     with pytest.raises(ValueError, match="exactly one"):
-        eval_run.trace_case("cases", case=case, case_id="x")
-    with pytest.raises(ValueError, match="exactly one"):
-        eval_run.mark_reviewed(batch_name="cases", decision="reviewed_pass")
+        eval_run.trace_task("tasks", task=task, task_id="x")
 
 
-def test_variants_trace_review_and_export_helpers_are_thin_runtime_calls():
+def test_variants_trace_and_export_helpers_are_thin_runtime_calls():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
 
     variants = eval_run.variants("model", [{"name": "a", "config": {"model": "a"}}])
-    worker = eval_run.worker(id="w1", resources={"gpu": "local"})
-    with eval_run.trace_case("cases", case_id="case") as trace:
+    with eval_run.trace_task("tasks", task_id="task") as trace:
         trace.model_request({"messages": []})
-    review = eval_run.mark_reviewed(
-        batch_name="cases", case_id="case", decision="reviewed_fail", note="wrong"
-    )
 
     assert variants[0]["name"] == "a"
-    assert worker.id == "w1"
     assert runtime.trace_events[0]["event_type"] == "model_request"
-    assert review["decision"] == "reviewed_fail"
     assert eval_run.summary() == {"run_id": "run"}
     assert eval_run.export() == "exported"

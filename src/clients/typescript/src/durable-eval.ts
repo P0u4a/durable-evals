@@ -59,8 +59,12 @@ export class DurableEval {
     };
   }
 
-  batch<TCase>(batchName: string, cases: TCase[]): Batch<TCase> {
-    return new Batch(this, batchName, cases);
+  dataset<TTask>(
+    datasetName: string,
+    tasks: TTask[],
+    options: { category?: (task: TTask) => string } = {},
+  ): Dataset<TTask> {
+    return new Dataset(this, datasetName, tasks, options.category);
   }
 
   async variants(
@@ -83,21 +87,11 @@ export class DurableEval {
     });
   }
 
-  async worker(options: { id: string; resources?: Record<string, unknown> }): Promise<Worker> {
-    const runtime = await this.getRuntime();
-    assertRuntimeMethod(runtime.registerWorker, "registerWorker");
-    const record = await runtime.registerWorker({
-      worker_id: options.id,
-      resources: options.resources ?? {},
-    });
-    return new Worker(this, record);
-  }
-
-  traceCase(
-    batchName: string,
-    options: { case?: unknown; caseId?: string; attempt?: number },
-  ): TraceCase {
-    return new TraceCase(this, batchName, resolveCaseId(options), options.attempt ?? 1);
+  traceTask(
+    datasetName: string,
+    options: { task?: unknown; taskId?: string; attempt?: number },
+  ): TraceTask {
+    return new TraceTask(this, datasetName, resolveTaskId(options), options.attempt ?? 1);
   }
 
   async memo<TValue>(
@@ -136,26 +130,6 @@ export class DurableEval {
     const runtime = await this.getRuntime();
     assertRuntimeMethod(runtime.export, "export");
     return (await runtime.export({ run_id: this.runId, kind })).body;
-  }
-
-  async markReviewed(options: {
-    batchName: string;
-    case?: unknown;
-    caseId?: string;
-    decision: string;
-    reviewer?: string;
-    note?: string;
-  }): Promise<Record<string, unknown>> {
-    const runtime = await this.getRuntime();
-    assertRuntimeMethod(runtime.markReviewed, "markReviewed");
-    return await runtime.markReviewed({
-      run_id: this.runId,
-      batch_name: options.batchName,
-      case_id: resolveCaseId(options),
-      reviewer: options.reviewer ?? "user",
-      decision: options.decision,
-      note: options.note,
-    });
   }
 
   private async runStep<TArgs extends unknown[], TOutput>(
@@ -201,7 +175,7 @@ export class DurableEval {
         error: {
           error_type: error instanceof Error ? error.name : "Error",
           message: error instanceof Error ? error.message : String(error),
-          failure_class: "user_code_error",
+          failure_class: "eval_exception",
           retryable: true,
         },
       });
@@ -235,26 +209,34 @@ export class DurableEval {
   }
 }
 
-export class Batch<TCase> {
+export class Dataset<TTask> {
   constructor(
     private readonly evalRun: DurableEval,
-    private readonly batchName: string,
-    private readonly cases: TCase[],
+    private readonly datasetName: string,
+    private readonly tasks: TTask[],
+    private readonly category?: (task: TTask) => string,
   ) {}
 
   async map<TOutput>(options: {
-    run: (testCase: TCase) => TOutput | Promise<TOutput>;
-    id?: (testCase: TCase) => string;
+    run: (task: TTask) => TOutput | Promise<TOutput>;
+    id?: (task: TTask) => string;
+    category?: (task: TTask) => string;
+    categories?: string[];
     concurrency?: number;
     progress?: (summary: Record<string, number>) => void;
     maxAttempts?: number;
   }): Promise<TOutput[]> {
     const runtime = await this.runtime();
-    const records = await this.register(options.id);
+    const categoryOf = options.category ?? this.category;
+    const records = await this.register(options.id, categoryOf);
     const byDigest = new Map(records.map((record) => [String(record.input_digest), record]));
+    const categoryFilter =
+      options.categories && options.categories.length > 0
+        ? new Set(options.categories)
+        : null;
     const positionsByDigest = new Map<string, number[]>();
-    for (const [index, testCase] of this.cases.entries()) {
-      const digest = digestJson(testCase);
+    for (const [index, task] of this.tasks.entries()) {
+      const digest = digestJson(task);
       const positions = positionsByDigest.get(digest);
       if (positions) {
         positions.push(index);
@@ -262,12 +244,12 @@ export class Batch<TCase> {
         positionsByDigest.set(digest, [index]);
       }
     }
-    const outputs = new Array<TOutput>(this.cases.length);
+    const outputs = new Array<TOutput>(this.tasks.length);
     const runnable: Array<{ digest: string; positions: number[] }> = [];
     for (const [digest, positions] of positionsByDigest) {
       const record = byDigest.get(digest);
       if (!record) {
-        throw new Error(`missing registered case: ${digest}`);
+        throw new Error(`missing registered task: ${digest}`);
       }
       if (record.status === "succeeded") {
         for (const position of positions) {
@@ -278,6 +260,13 @@ export class Batch<TCase> {
       if (record.status === "terminal") {
         continue;
       }
+      if (categoryFilter) {
+        const task = this.tasks[positions[0]];
+        const taskCategory = categoryOf ? categoryOf(task) : undefined;
+        if (taskCategory === undefined || !categoryFilter.has(taskCategory)) {
+          continue;
+        }
+      }
       runnable.push({ digest, positions });
     }
     let cursor = 0;
@@ -287,13 +276,13 @@ export class Batch<TCase> {
     const worker = async (): Promise<void> => {
       while (cursor < runnable.length) {
         const { digest, positions } = runnable[cursor++];
-        const testCase = this.cases[positions[0]];
+        const task = this.tasks[positions[0]];
         try {
-          const output = await options.run(testCase);
-          assertJsonSerializable(output, `batch output for ${this.batchName}`);
-          await runtime.completeCase!({
+          const output = await options.run(task);
+          assertJsonSerializable(output, `dataset output for ${this.datasetName}`);
+          await runtime.completeTask!({
             run_id: this.evalRun.runId,
-            batch_name: this.batchName,
+            dataset_name: this.datasetName,
             input_digest: digest,
             output,
           });
@@ -303,10 +292,10 @@ export class Batch<TCase> {
           options.progress?.(await this.summary());
         } catch (error) {
           // Record the failure durably and keep going; aborting here would cancel
-          // sibling cases that are still running.
-          await runtime.failCase!({
+          // sibling tasks that are still running.
+          await runtime.failTask!({
             run_id: this.evalRun.runId,
-            batch_name: this.batchName,
+            dataset_name: this.datasetName,
             input_digest: digest,
             error: errorPayload(error),
             max_attempts: maxAttempts,
@@ -323,9 +312,9 @@ export class Batch<TCase> {
 
   async summary(): Promise<Record<string, number>> {
     const records = await this.runtime().then((runtime) =>
-      runtime.listCases!({
+      runtime.listTasks!({
         run_id: this.evalRun.runId,
-        batch_name: this.batchName,
+        dataset_name: this.datasetName,
         statuses: [],
       }),
     );
@@ -345,72 +334,63 @@ export class Batch<TCase> {
   }
 
   async failed(): Promise<Array<Record<string, unknown>>> {
-    return await this.casesByStatus(["failed"]);
+    return await this.tasksByStatus(["failed"]);
   }
 
   async terminal(): Promise<Array<Record<string, unknown>>> {
-    return await this.casesByStatus(["terminal"]);
+    return await this.tasksByStatus(["terminal"]);
   }
 
   async missing(): Promise<Array<Record<string, unknown>>> {
-    return await this.casesByStatus(["pending"]);
+    return await this.tasksByStatus(["pending"]);
   }
 
   private async register(
-    id?: (testCase: TCase) => string,
+    id?: (task: TTask) => string,
+    category?: (task: TTask) => string,
   ): Promise<Array<Record<string, unknown>>> {
     const runtime = await this.runtime();
-    await runtime.registerBatch!({
+    await runtime.registerDataset!({
       run_id: this.evalRun.runId,
-      batch_name: this.batchName,
-      cases: this.cases.map((testCase) => ({
-        input_digest: digestJson(testCase),
-        input: testCase,
-        label: id ? id(testCase) : null,
+      dataset_name: this.datasetName,
+      tasks: this.tasks.map((task) => ({
+        input_digest: digestJson(task),
+        input: task,
+        label: id ? id(task) : null,
+        category: category ? category(task) : null,
       })),
     });
-    return await runtime.listCases!({
+    return await runtime.listTasks!({
       run_id: this.evalRun.runId,
-      batch_name: this.batchName,
+      dataset_name: this.datasetName,
       statuses: [],
     });
   }
 
-  private async casesByStatus(statuses: string[]): Promise<Array<Record<string, unknown>>> {
+  private async tasksByStatus(statuses: string[]): Promise<Array<Record<string, unknown>>> {
     const runtime = await this.runtime();
-    return await runtime.listCases!({
+    return await runtime.listTasks!({
       run_id: this.evalRun.runId,
-      batch_name: this.batchName,
+      dataset_name: this.datasetName,
       statuses,
     });
   }
 
   private async runtime(): Promise<Runtime> {
     const runtime = await (this.evalRun as unknown as { getRuntime(): Promise<Runtime> }).getRuntime();
-    assertRuntimeMethod(runtime.registerBatch, "registerBatch");
-    assertRuntimeMethod(runtime.listCases, "listCases");
-    assertRuntimeMethod(runtime.completeCase, "completeCase");
-    assertRuntimeMethod(runtime.failCase, "failCase");
+    assertRuntimeMethod(runtime.registerDataset, "registerDataset");
+    assertRuntimeMethod(runtime.listTasks, "listTasks");
+    assertRuntimeMethod(runtime.completeTask, "completeTask");
+    assertRuntimeMethod(runtime.failTask, "failTask");
     return runtime;
   }
 }
 
-export class Worker {
-  readonly id: string;
-
-  constructor(
-    readonly evalRun: DurableEval,
-    readonly record: Record<string, unknown>,
-  ) {
-    this.id = String(record.worker_id);
-  }
-}
-
-export class TraceCase {
+export class TraceTask {
   constructor(
     private readonly evalRun: DurableEval,
-    private readonly batchName: string,
-    private readonly caseId: string,
+    private readonly datasetName: string,
+    private readonly taskId: string,
     private readonly attempt: number,
   ) {}
 
@@ -423,8 +403,8 @@ export class TraceCase {
     assertRuntimeMethod(runtime.traceEvent, "traceEvent");
     return await runtime.traceEvent({
       run_id: this.evalRun.runId,
-      batch_name: this.batchName,
-      case_id: this.caseId,
+      dataset_name: this.datasetName,
+      task_id: this.taskId,
       attempt: this.attempt,
       event_type: eventType,
       payload,
@@ -461,13 +441,13 @@ export class TraceCase {
   }
 }
 
-function resolveCaseId(options: { case?: unknown; caseId?: string }): string {
-  const hasCase = options.case !== undefined;
-  const hasCaseId = options.caseId !== undefined;
-  if (hasCase === hasCaseId) {
-    throw new TypeError("exactly one of case or caseId is required");
+function resolveTaskId(options: { task?: unknown; taskId?: string }): string {
+  const hasTask = options.task !== undefined;
+  const hasTaskId = options.taskId !== undefined;
+  if (hasTask === hasTaskId) {
+    throw new TypeError("exactly one of task or taskId is required");
   }
-  return hasCase ? digestJson(options.case) : String(options.caseId);
+  return hasTask ? digestJson(options.task) : String(options.taskId);
 }
 
 function inputDigestFor(stepName: string, args: unknown[]): string {
@@ -525,7 +505,7 @@ function errorPayload(error: unknown): Record<string, unknown> {
   return {
     error_type: error instanceof Error ? error.name : "Error",
     message: error instanceof Error ? error.message : String(error),
-    failure_class: "user_code_error",
+    failure_class: "eval_exception",
     retryable: true,
   };
 }

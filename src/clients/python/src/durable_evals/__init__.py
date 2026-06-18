@@ -1,12 +1,11 @@
-from .eval import Batch, DurableEval, TraceCase, Worker
+from .eval import Dataset, DurableEval, TraceTask
 from .step import DurableStepFailed, DurableStepInProgress, step
 
 __all__ = [
-    "Batch",
+    "Dataset",
     "DurableEval",
     "DurableStepFailed",
     "DurableStepInProgress",
-    "TraceCase",
-    "Worker",
+    "TraceTask",
     "step",
 ]

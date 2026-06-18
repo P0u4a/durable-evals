@@ -125,7 +125,7 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
                 "error": {
                     "error_type": type(exc).__name__,
                     "message": str(exc),
-                    "failure_class": "user_code_error",
+                    "failure_class": "eval_exception",
                     "retryable": True,
                 },
             }
@@ -142,7 +142,7 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
                 "error": {
                     "error_type": type(exc).__name__,
                     "message": str(exc),
-                    "failure_class": "user_code_error",
+                    "failure_class": "eval_exception",
                     "retryable": True,
                 },
             }

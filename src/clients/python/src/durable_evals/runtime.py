@@ -114,29 +114,23 @@ class RuntimeClient:
     def export(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/runs/export", payload)
 
-    def register_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/batches/register", payload)
+    def register_dataset(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/datasets/register", payload)
 
-    def list_cases(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        return self._post("/batches/cases/list", payload)
+    def list_tasks(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._post("/datasets/tasks/list", payload)
 
-    def complete_case(self, payload: dict[str, Any]) -> None:
-        self._post("/batches/cases/complete", payload)
+    def complete_task(self, payload: dict[str, Any]) -> None:
+        self._post("/datasets/tasks/complete", payload)
 
-    def fail_case(self, payload: dict[str, Any]) -> None:
-        self._post("/batches/cases/fail", payload)
+    def fail_task(self, payload: dict[str, Any]) -> None:
+        self._post("/datasets/tasks/fail", payload)
 
     def register_variants(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         return self._post("/variants/register", payload)
 
-    def register_worker(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/workers/register", payload)
-
     def trace_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/traces/events", payload)
-
-    def mark_reviewed(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/reviews", payload)
 
     def memo_get(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/memos/get", payload)
@@ -153,20 +147,20 @@ class RuntimeClient:
     async def afail_step(self, payload: dict[str, Any]) -> None:
         await self._apost("/steps/fail", payload)
 
-    async def aregister_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._apost("/batches/register", payload)
+    async def aregister_dataset(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._apost("/datasets/register", payload)
 
-    async def alist_cases(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        return await self._apost("/batches/cases/list", payload)
+    async def alist_tasks(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return await self._apost("/datasets/tasks/list", payload)
 
     async def asummary(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._apost("/runs/summary", payload)
 
-    async def acomplete_case(self, payload: dict[str, Any]) -> None:
-        await self._apost("/batches/cases/complete", payload)
+    async def acomplete_task(self, payload: dict[str, Any]) -> None:
+        await self._apost("/datasets/tasks/complete", payload)
 
-    async def afail_case(self, payload: dict[str, Any]) -> None:
-        await self._apost("/batches/cases/fail", payload)
+    async def afail_task(self, payload: dict[str, Any]) -> None:
+        await self._apost("/datasets/tasks/fail", payload)
 
     async def amemo_get(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._apost("/memos/get", payload)

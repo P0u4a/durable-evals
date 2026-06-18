@@ -2,7 +2,7 @@
 
 TypeScript client for Durable Evals.
 
-## Batch Evals
+## Dataset Evals
 
 ```ts
 import { DurableEval } from "durable-evals";
@@ -12,17 +12,19 @@ const evalRun = new DurableEval({
   config: { model: "local" },
 });
 
-const results = await evalRun.batch("inferCases", cases).map({
-  run: async (testCase) => model.infer(testCase),
-  id: (testCase) => testCase.id, // optional human-readable label
+const results = await evalRun.dataset("inferTasks", tasks).map({
+  run: async (task) => model.infer(task),
+  id: (task) => task.id, // optional human-readable label
+  category: (task) => task.category, // optional category
+  categories: ["greeting"], // optional: only run these categories
   concurrency: 8,
 });
 ```
 
-Case identity is the SHA-256 digest of the case input, so completed cases are
-skipped on rerun and a changed input becomes a new pending case. Duplicate
+Task identity is the SHA-256 digest of the task input, so completed tasks are
+skipped on rerun and a changed input becomes a new pending task. Duplicate
 inputs run once and their output is reused at every position. Failed retryable
-cases can be retried, and terminal cases are preserved unless explicitly reset.
+tasks can be retried, and terminal tasks are preserved unless explicitly reset.
 
 ## Memos
 
@@ -39,7 +41,7 @@ digest within a run; later calls return the stored value.
 
 ```ts
 const prepareData = evalRun.step("prepareData", async () => [
-  { id: "case-1" },
+  { id: "task-1" },
 ]);
 
 const score = evalRun.step(
@@ -50,10 +52,10 @@ const score = evalRun.step(
 ```
 
 Callback failures are recorded as workload failures. Serialization, storage, and
-completion failures are raised to the caller and are not recorded as case or step
+completion failures are raised to the caller and are not recorded as task or step
 failures.
 
-## Variants, Traces, Reviews, And Reports
+## Variants, Traces, And Reports
 
 ```ts
 await evalRun.variants("prompt", [
@@ -61,21 +63,14 @@ await evalRun.variants("prompt", [
   { name: "candidate", config: { prompt: "v2" } },
 ]);
 
-const trace = evalRun.traceCase("agentCases", { case: testCase });
+const trace = evalRun.traceTask("agentTasks", { task });
 await trace.modelRequest({ messages: [] });
 await trace.modelResponse({ content: "ok" });
 await trace.scoringEvent({ score: 1 });
-
-await evalRun.markReviewed({
-  batchName: "agentCases",
-  case: testCase,
-  decision: "reviewed_pass",
-  note: "Correct tool sequence",
-});
 ```
 
-`traceCase` and `markReviewed` take exactly one of `case` (digested to the case
-id) or `caseId` (an explicit id, by convention the input digest).
+`traceTask` takes exactly one of `task` (digested to the task id) or `taskId`
+(an explicit id, by convention the input digest).
 
 ```ts
 

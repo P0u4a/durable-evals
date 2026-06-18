@@ -18,16 +18,14 @@ export interface Runtime {
   registerRun?(payload: Record<string, unknown>): Promise<void>;
   summary?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
   export?(payload: Record<string, unknown>): Promise<{ body: string; content_type?: string }>;
-  registerBatch?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
-  listCases?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
-  completeCase?(payload: Record<string, unknown>): Promise<void>;
-  failCase?(payload: Record<string, unknown>): Promise<void>;
+  registerDataset?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  listTasks?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
+  completeTask?(payload: Record<string, unknown>): Promise<void>;
+  failTask?(payload: Record<string, unknown>): Promise<void>;
   memoGet?(payload: Record<string, unknown>): Promise<{ found: boolean; value: unknown }>;
   memoPut?(payload: Record<string, unknown>): Promise<{ ok: boolean }>;
   registerVariants?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
-  registerWorker?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
   traceEvent?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
-  markReviewed?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 
 export class RuntimeClient implements Runtime {
@@ -156,20 +154,20 @@ export class RuntimeClient implements Runtime {
     return (await this.post("/runs/export", payload)) as { body: string; content_type?: string };
   }
 
-  async registerBatch(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return (await this.post("/batches/register", payload)) as Record<string, unknown>;
+  async registerDataset(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return (await this.post("/datasets/register", payload)) as Record<string, unknown>;
   }
 
-  async listCases(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
-    return (await this.post("/batches/cases/list", payload)) as Array<Record<string, unknown>>;
+  async listTasks(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
+    return (await this.post("/datasets/tasks/list", payload)) as Array<Record<string, unknown>>;
   }
 
-  async completeCase(payload: Record<string, unknown>): Promise<void> {
-    await this.post("/batches/cases/complete", payload);
+  async completeTask(payload: Record<string, unknown>): Promise<void> {
+    await this.post("/datasets/tasks/complete", payload);
   }
 
-  async failCase(payload: Record<string, unknown>): Promise<void> {
-    await this.post("/batches/cases/fail", payload);
+  async failTask(payload: Record<string, unknown>): Promise<void> {
+    await this.post("/datasets/tasks/fail", payload);
   }
 
   async memoGet(payload: Record<string, unknown>): Promise<{ found: boolean; value: unknown }> {
@@ -184,16 +182,8 @@ export class RuntimeClient implements Runtime {
     return (await this.post("/variants/register", payload)) as Array<Record<string, unknown>>;
   }
 
-  async registerWorker(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return (await this.post("/workers/register", payload)) as Record<string, unknown>;
-  }
-
   async traceEvent(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
     return (await this.post("/traces/events", payload)) as Record<string, unknown>;
-  }
-
-  async markReviewed(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return (await this.post("/reviews", payload)) as Record<string, unknown>;
   }
 
   private async post(

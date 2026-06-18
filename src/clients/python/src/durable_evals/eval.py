@@ -21,10 +21,10 @@ def _json_digest(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _resolve_case_id(case: Any, case_id: str | None) -> str:
-    if (case is None) == (case_id is None):
-        raise ValueError("provide exactly one of case or case_id")
-    return case_id if case_id is not None else _json_digest(case)
+def _resolve_task_id(task: Any, task_id: str | None) -> str:
+    if (task is None) == (task_id is None):
+        raise ValueError("provide exactly one of task or task_id")
+    return task_id if task_id is not None else _json_digest(task)
 
 
 class DurableEval:
@@ -46,11 +46,11 @@ class DurableEval:
                 {"run_id": self.run_id, "name": self.name, "config": self.config}
             )
 
-    def batch(self, batch_name: str, cases: Iterable[Any], **kwargs: Any) -> "Batch":
-        batch = Batch(self, batch_name, list(cases))
+    def dataset(self, dataset_name: str, tasks: Iterable[Any], **kwargs: Any) -> "Dataset":
+        dataset = Dataset(self, dataset_name, list(tasks))
         if kwargs:
-            return batch.map(**kwargs)
-        return batch
+            return dataset.map(**kwargs)
+        return dataset
 
     def variants(self, dimension: str, variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
         payload = []
@@ -67,21 +67,15 @@ class DurableEval:
             {"run_id": self.run_id, "dimension": dimension, "variants": payload}
         )
 
-    def worker(self, *, id: str, resources: dict[str, Any] | None = None) -> "Worker":
-        record = self._runtime.register_worker(
-            {"worker_id": id, "resources": resources or {}}
-        )
-        return Worker(self, record)
-
-    def trace_case(
+    def trace_task(
         self,
-        batch_name: str,
+        dataset_name: str,
         *,
-        case: Any = None,
-        case_id: str | None = None,
+        task: Any = None,
+        task_id: str | None = None,
         attempt: int = 1,
-    ) -> "TraceCase":
-        return TraceCase(self, batch_name, _resolve_case_id(case, case_id), attempt)
+    ) -> "TraceTask":
+        return TraceTask(self, dataset_name, _resolve_task_id(task, task_id), attempt)
 
     def memo(self, key: Any, fn: Callable[[], Any]) -> Any:
         key_digest = _json_digest(key)
@@ -119,45 +113,26 @@ class DurableEval:
     def export(self, kind: str = "manifest_json") -> str:
         return self._runtime.export({"run_id": self.run_id, "kind": kind})["body"]
 
-    def mark_reviewed(
-        self,
-        *,
-        batch_name: str,
-        case: Any = None,
-        case_id: str | None = None,
-        decision: str,
-        reviewer: str = "user",
-        note: str | None = None,
-    ) -> dict[str, Any]:
-        return self._runtime.mark_reviewed(
-            {
-                "run_id": self.run_id,
-                "batch_name": batch_name,
-                "case_id": _resolve_case_id(case, case_id),
-                "reviewer": reviewer,
-                "decision": decision,
-                "note": note,
-            }
-        )
 
-
-class Batch:
-    def __init__(self, eval_run: DurableEval, batch_name: str, cases: list[Any]):
+class Dataset:
+    def __init__(self, eval_run: DurableEval, dataset_name: str, tasks: list[Any]):
         self.eval = eval_run
-        self.batch_name = batch_name
-        self.cases = cases
+        self.dataset_name = dataset_name
+        self.tasks = tasks
 
     def map(
         self,
         *,
         run: Callable[[Any], Any],
         id: Callable[[Any], str] | None = None,
+        category: Callable[[Any], str] | None = None,
+        categories: list[str] | None = None,
         concurrency: int = 1,
         progress: Callable[[dict[str, int]], None] | None = None,
         max_attempts: int = 3,
     ) -> list[Any]:
-        records = self._register(id)
-        outputs: list[Any] = [None] * len(self.cases)
+        records = self._register(id, category)
+        outputs: list[Any] = [None] * len(self.tasks)
         runnable: list[tuple[list[int], Any, dict[str, Any]]] = []
         by_digest = {record["input_digest"]: record for record in records}
         for digest, indexes in self._positions().items():
@@ -165,8 +140,8 @@ class Batch:
             if record["status"] == "succeeded":
                 for index in indexes:
                     outputs[index] = record.get("output")
-            elif record["status"] != "terminal":
-                runnable.append((indexes, self.cases[indexes[0]], record))
+            elif record["status"] != "terminal" and self._in_categories(record, categories):
+                runnable.append((indexes, self.tasks[indexes[0]], record))
 
         if concurrency <= 1:
             for item in runnable:
@@ -177,8 +152,8 @@ class Batch:
                     executor.submit(self._run_one, item, run, outputs, progress, max_attempts)
                     for item in runnable
                 ]
-                # Surfacing the first exception would abort sibling cases; a failing case
-                # is already recorded durably, so let the batch run to completion.
+                # Surfacing the first exception would abort sibling tasks; a failing task
+                # is already recorded durably, so let the dataset run to completion.
                 for future in as_completed(futures):
                     future.result()
         return outputs
@@ -188,37 +163,39 @@ class Batch:
         *,
         run: Callable[[Any], Any],
         id: Callable[[Any], str] | None = None,
+        category: Callable[[Any], str] | None = None,
+        categories: list[str] | None = None,
         concurrency: int = 10,
         progress: Callable[[dict[str, int]], None] | None = None,
         max_attempts: int = 3,
     ) -> list[Any]:
-        records = await self._aregister(id)
-        outputs: list[Any] = [None] * len(self.cases)
+        records = await self._aregister(id, category)
+        outputs: list[Any] = [None] * len(self.tasks)
         semaphore = asyncio.Semaphore(concurrency)
         by_digest = {record["input_digest"]: record for record in records}
 
-        async def run_one(indexes: list[int], case: Any, record: dict[str, Any]) -> None:
+        async def run_one(indexes: list[int], task: Any, record: dict[str, Any]) -> None:
             async with semaphore:
                 try:
-                    result = run(case)
+                    result = run(task)
                     if inspect.isawaitable(result):
                         result = await result
                 except Exception as exc:
-                    # Record and move on so one bad case doesn't cancel the batch.
-                    await self.eval._runtime.afail_case(
+                    # Record and move on so one bad task doesn't cancel the dataset.
+                    await self.eval._runtime.afail_task(
                         {
                             "run_id": self.eval.run_id,
-                            "batch_name": self.batch_name,
+                            "dataset_name": self.dataset_name,
                             "input_digest": record["input_digest"],
                             "error": _error_payload(exc),
                             "max_attempts": max_attempts,
                         }
                     )
                     return
-                await self.eval._runtime.acomplete_case(
+                await self.eval._runtime.acomplete_task(
                     {
                         "run_id": self.eval.run_id,
-                        "batch_name": self.batch_name,
+                        "dataset_name": self.dataset_name,
                         "input_digest": record["input_digest"],
                         "output": result,
                     }
@@ -234,23 +211,29 @@ class Batch:
             if record["status"] == "succeeded":
                 for index in indexes:
                     outputs[index] = record.get("output")
-            elif record["status"] != "terminal":
-                tasks.append(asyncio.create_task(run_one(indexes, self.cases[indexes[0]], record)))
+            elif record["status"] != "terminal" and self._in_categories(record, categories):
+                tasks.append(asyncio.create_task(run_one(indexes, self.tasks[indexes[0]], record)))
         if tasks:
             await asyncio.gather(*tasks)
         return outputs
 
+    @staticmethod
+    def _in_categories(record: dict[str, Any], categories: list[str] | None) -> bool:
+        if not categories:
+            return True
+        return record.get("category") in categories
+
     def summary(self) -> dict[str, int]:
         return self._counts(
-            self.eval._runtime.list_cases(
-                {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": []}
+            self.eval._runtime.list_tasks(
+                {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": []}
             )
         )
 
     async def _asummary(self) -> dict[str, int]:
         return self._counts(
-            await self.eval._runtime.alist_cases(
-                {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": []}
+            await self.eval._runtime.alist_tasks(
+                {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": []}
             )
         )
 
@@ -263,57 +246,72 @@ class Batch:
         return counts
 
     def failed(self) -> list[dict[str, Any]]:
-        return self._cases(["failed"])
+        return self._tasks(["failed"])
 
     def terminal(self) -> list[dict[str, Any]]:
-        return self._cases(["terminal"])
+        return self._tasks(["terminal"])
 
     def missing(self) -> list[dict[str, Any]]:
-        return self._cases(["pending"])
+        return self._tasks(["pending"])
 
-    def _cases(self, statuses: list[str]) -> list[dict[str, Any]]:
-        return self.eval._runtime.list_cases(
-            {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": statuses}
+    def _tasks(self, statuses: list[str]) -> list[dict[str, Any]]:
+        return self.eval._runtime.list_tasks(
+            {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": statuses}
         )
 
     def _positions(self) -> dict[str, list[int]]:
         positions: dict[str, list[int]] = {}
-        for index, case in enumerate(self.cases):
-            positions.setdefault(_json_digest(case), []).append(index)
+        for index, task in enumerate(self.tasks):
+            positions.setdefault(_json_digest(task), []).append(index)
         return positions
 
-    def _case_payloads(self, id: Callable[[Any], str] | None) -> list[dict[str, Any]]:
-        return [
-            {
-                "input_digest": _json_digest(case),
-                "input": case,
-                "label": str(id(case)) if id else None,
+    def _task_payloads(
+        self,
+        id: Callable[[Any], str] | None,
+        category: Callable[[Any], str] | None,
+    ) -> list[dict[str, Any]]:
+        payloads = []
+        for task in self.tasks:
+            payload = {
+                "input_digest": _json_digest(task),
+                "input": task,
+                "label": str(id(task)) if id else None,
             }
-            for case in self.cases
-        ]
+            if category is not None:
+                payload["category"] = str(category(task))
+            payloads.append(payload)
+        return payloads
 
-    def _register(self, id: Callable[[Any], str] | None) -> list[dict[str, Any]]:
-        self.eval._runtime.register_batch(
+    def _register(
+        self,
+        id: Callable[[Any], str] | None,
+        category: Callable[[Any], str] | None,
+    ) -> list[dict[str, Any]]:
+        self.eval._runtime.register_dataset(
             {
                 "run_id": self.eval.run_id,
-                "batch_name": self.batch_name,
-                "cases": self._case_payloads(id),
+                "dataset_name": self.dataset_name,
+                "tasks": self._task_payloads(id, category),
             }
         )
-        return self.eval._runtime.list_cases(
-            {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": []}
+        return self.eval._runtime.list_tasks(
+            {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": []}
         )
 
-    async def _aregister(self, id: Callable[[Any], str] | None) -> list[dict[str, Any]]:
-        await self.eval._runtime.aregister_batch(
+    async def _aregister(
+        self,
+        id: Callable[[Any], str] | None,
+        category: Callable[[Any], str] | None,
+    ) -> list[dict[str, Any]]:
+        await self.eval._runtime.aregister_dataset(
             {
                 "run_id": self.eval.run_id,
-                "batch_name": self.batch_name,
-                "cases": self._case_payloads(id),
+                "dataset_name": self.dataset_name,
+                "tasks": self._task_payloads(id, category),
             }
         )
-        return await self.eval._runtime.alist_cases(
-            {"run_id": self.eval.run_id, "batch_name": self.batch_name, "statuses": []}
+        return await self.eval._runtime.alist_tasks(
+            {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": []}
         )
 
     def _run_one(
@@ -324,15 +322,15 @@ class Batch:
         progress: Callable[[dict[str, int]], None] | None,
         max_attempts: int,
     ) -> None:
-        indexes, case, record = item
+        indexes, task, record = item
         try:
-            result = run(case)
+            result = run(task)
         except Exception as exc:
-            # Record and move on so one bad case doesn't abort the batch.
-            self.eval._runtime.fail_case(
+            # Record and move on so one bad task doesn't abort the dataset.
+            self.eval._runtime.fail_task(
                 {
                     "run_id": self.eval.run_id,
-                    "batch_name": self.batch_name,
+                    "dataset_name": self.dataset_name,
                     "input_digest": record["input_digest"],
                     "error": _error_payload(exc),
                     "max_attempts": max_attempts,
@@ -342,11 +340,11 @@ class Batch:
         if inspect.isawaitable(result):
             if inspect.iscoroutine(result):
                 result.close()
-            raise TypeError("sync batch callback returned an awaitable")
-        self.eval._runtime.complete_case(
+            raise TypeError("sync dataset callback returned an awaitable")
+        self.eval._runtime.complete_task(
             {
                 "run_id": self.eval.run_id,
-                "batch_name": self.batch_name,
+                "dataset_name": self.dataset_name,
                 "input_digest": record["input_digest"],
                 "output": result,
             }
@@ -357,18 +355,11 @@ class Batch:
             progress(self.summary())
 
 
-class Worker:
-    def __init__(self, eval_run: DurableEval, record: dict[str, Any]):
+class TraceTask(AbstractContextManager["TraceTask"]):
+    def __init__(self, eval_run: DurableEval, dataset_name: str, task_id: str, attempt: int):
         self.eval = eval_run
-        self.record = record
-        self.id = record["worker_id"]
-
-
-class TraceCase(AbstractContextManager["TraceCase"]):
-    def __init__(self, eval_run: DurableEval, batch_name: str, case_id: str, attempt: int):
-        self.eval = eval_run
-        self.batch_name = batch_name
-        self.case_id = case_id
+        self.dataset_name = dataset_name
+        self.task_id = task_id
         self.attempt = attempt
 
     def event(
@@ -381,8 +372,8 @@ class TraceCase(AbstractContextManager["TraceCase"]):
         return self.eval._runtime.trace_event(
             {
                 "run_id": self.eval.run_id,
-                "batch_name": self.batch_name,
-                "case_id": self.case_id,
+                "dataset_name": self.dataset_name,
+                "task_id": self.task_id,
                 "attempt": self.attempt,
                 "event_type": event_type,
                 "payload": payload,
@@ -419,6 +410,6 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
     return {
         "error_type": type(exc).__name__,
         "message": str(exc),
-        "failure_class": "user_code_error",
+        "failure_class": "eval_exception",
         "retryable": True,
     }

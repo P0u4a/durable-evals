@@ -1,8 +1,7 @@
 export {
-  Batch,
+  Dataset,
   DurableEval,
-  TraceCase,
-  Worker,
+  TraceTask,
   type DurableEvalOptions,
   type DurableStep,
   type StepCallback,
