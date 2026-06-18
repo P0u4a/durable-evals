@@ -11,13 +11,13 @@ use sha2::{Digest, Sha256};
 use crate::store::{Error, Result, Store};
 use crate::types::*;
 
-/// Cases are content-addressed: edits to an input create a new row under a new digest.
+/// Tasks are content-addressed: edits to an input create a new row under a new digest.
 /// Rows from earlier registrations are kept (so reverting an input reuses its old
-/// output) but only the latest registration's generation counts as the batch.
-const CURRENT_GENERATION: &str = "batch_cases.generation = COALESCE(
-    (SELECT b.generation FROM batches b
-     WHERE b.run_id = batch_cases.run_id AND b.batch_name = batch_cases.batch_name),
-    batch_cases.generation)";
+/// output) but only the latest registration's generation counts as the dataset.
+const CURRENT_GENERATION: &str = "tasks.generation = COALESCE(
+    (SELECT d.generation FROM datasets d
+     WHERE d.run_id = tasks.run_id AND d.dataset_name = tasks.dataset_name),
+    tasks.generation)";
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -93,7 +93,7 @@ impl SqliteStore {
                     error: parse_optional(error_json)?.unwrap_or(ErrorInfo {
                         error_type: "StepFailed".to_string(),
                         message: "step failed".to_string(),
-                        failure_class: FailureClass::TerminalEval,
+                        failure_class: FailureClass::DurableHarnessError,
                         stack: None,
                         retryable: Some(false),
                     }),
@@ -116,7 +116,7 @@ impl SqliteStore {
                     error: ErrorInfo {
                         error_type: "MaxAttemptsExceeded".to_string(),
                         message: "step exceeded retry policy max_attempts".to_string(),
-                        failure_class: FailureClass::TerminalEval,
+                        failure_class: FailureClass::DurableHarnessError,
                         stack: None,
                         retryable: Some(false),
                     },
@@ -273,9 +273,7 @@ impl SqliteStore {
                 delay_secs
             ],
         )?;
-        let failure_class = serde_json::to_string(&req.error.failure_class)?
-            .trim_matches('"')
-            .to_string();
+        let failure_class = failure_class_to_str(&req.error.failure_class);
         conn.execute(
             "INSERT INTO failure_records
              (run_id, step_name, input_digest, attempt, failure_class, error_type,
@@ -296,78 +294,80 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn register_batch(&self, req: RegisterBatchRequest) -> Result<BatchSummary> {
+    pub fn register_dataset(&self, req: RegisterDatasetRequest) -> Result<DatasetSummary> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO batches (run_id, batch_name, generation)
+            "INSERT INTO datasets (run_id, dataset_name, generation)
              VALUES (?1, ?2, 1)
-             ON CONFLICT(run_id, batch_name) DO UPDATE SET generation = generation + 1",
-            params![req.run_id, req.batch_name],
+             ON CONFLICT(run_id, dataset_name) DO UPDATE SET generation = generation + 1",
+            params![req.run_id, req.dataset_name],
         )?;
         let generation: u32 = tx.query_row(
-            "SELECT generation FROM batches WHERE run_id = ?1 AND batch_name = ?2",
-            params![req.run_id, req.batch_name],
+            "SELECT generation FROM datasets WHERE run_id = ?1 AND dataset_name = ?2",
+            params![req.run_id, req.dataset_name],
             |row| row.get(0),
         )?;
-        // Identical inputs collapse to one content-addressed case; first occurrence wins.
+        // Identical inputs collapse to one content-addressed task; first occurrence wins.
         let mut seen = std::collections::BTreeSet::new();
-        for (idx, case) in req.cases.iter().enumerate() {
-            if !seen.insert(case.input_digest.clone()) {
+        for (idx, task) in req.tasks.iter().enumerate() {
+            if !seen.insert(task.input_digest.clone()) {
                 continue;
             }
             tx.execute(
-                "INSERT INTO batch_cases
-                 (run_id, batch_name, input_digest, label, position, generation, input_json,
-                  status, attempt, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, datetime('now'), datetime('now'))
-                 ON CONFLICT(run_id, batch_name, input_digest) DO UPDATE SET
+                "INSERT INTO tasks
+                 (run_id, dataset_name, input_digest, label, category, position, generation,
+                  input_json, status, attempt, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, datetime('now'), datetime('now'))
+                 ON CONFLICT(run_id, dataset_name, input_digest) DO UPDATE SET
                     label = excluded.label,
+                    category = excluded.category,
                     position = excluded.position,
                     generation = excluded.generation,
                     updated_at = datetime('now')",
                 params![
                     req.run_id,
-                    req.batch_name,
-                    case.input_digest,
-                    case.label,
+                    req.dataset_name,
+                    task.input_digest,
+                    task.label,
+                    task.category,
                     idx as u32,
                     generation,
-                    serde_json::to_string(&case.input)?
+                    serde_json::to_string(&task.input)?
                 ],
             )?;
         }
         tx.commit()?;
-        drop(conn); // release before batch_summary re-locks the connection
-        self.batch_summary(&req.run_id, &req.batch_name)
+        drop(conn); // release before dataset_summary re-locks the connection
+        self.dataset_summary(&req.run_id, &req.dataset_name)
     }
 
-    pub fn complete_case(&self, req: CompleteCaseRequest) -> Result<()> {
+    pub fn complete_task(&self, req: CompleteTaskRequest) -> Result<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let updated = conn.execute(
-            "UPDATE batch_cases
+            "UPDATE tasks
              SET status = 'succeeded', output_json = ?4, error_json = NULL,
                  completed_at = datetime('now'), updated_at = datetime('now')
-             WHERE run_id = ?1 AND batch_name = ?2 AND input_digest = ?3",
+             WHERE run_id = ?1 AND dataset_name = ?2 AND input_digest = ?3",
             params![
                 req.run_id,
-                req.batch_name,
+                req.dataset_name,
                 req.input_digest,
                 serde_json::to_string(&req.output)?
             ],
         )?;
         if updated == 0 {
-            return Err(Error::CaseNotFound);
+            return Err(Error::TaskNotFound);
         }
         Ok(())
     }
 
-    pub fn fail_case(&self, req: FailCaseRequest) -> Result<()> {
+    pub fn fail_task(&self, req: FailTaskRequest) -> Result<()> {
         let retryable = req.error.retryable.unwrap_or(matches!(
             req.error.failure_class,
             FailureClass::Transient
                 | FailureClass::ResourceUnavailable
-                | FailureClass::UserCodeError
+                | FailureClass::EvalException
         ));
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let tx = conn.unchecked_transaction()?;
@@ -375,13 +375,13 @@ impl SqliteStore {
         // ceiling is reached, mirroring the step retry policy.
         let attempt: u32 = tx
             .query_row(
-                "SELECT attempt FROM batch_cases
-                 WHERE run_id = ?1 AND batch_name = ?2 AND input_digest = ?3",
-                params![req.run_id, req.batch_name, req.input_digest],
+                "SELECT attempt FROM tasks
+                 WHERE run_id = ?1 AND dataset_name = ?2 AND input_digest = ?3",
+                params![req.run_id, req.dataset_name, req.input_digest],
                 |row| row.get(0),
             )
             .optional()?
-            .ok_or(Error::CaseNotFound)?;
+            .ok_or(Error::TaskNotFound)?;
         let next_attempt = attempt + 1;
         let exhausted = next_attempt >= req.max_attempts;
         let status = if retryable && !exhausted {
@@ -390,13 +390,13 @@ impl SqliteStore {
             "terminal"
         };
         tx.execute(
-            "UPDATE batch_cases
+            "UPDATE tasks
              SET status = ?4, attempt = ?5, error_json = ?6,
                  completed_at = datetime('now'), updated_at = datetime('now')
-             WHERE run_id = ?1 AND batch_name = ?2 AND input_digest = ?3",
+             WHERE run_id = ?1 AND dataset_name = ?2 AND input_digest = ?3",
             params![
                 req.run_id,
-                req.batch_name,
+                req.dataset_name,
                 req.input_digest,
                 status,
                 next_attempt,
@@ -407,33 +407,38 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn list_cases(&self, req: ListCasesRequest) -> Result<Vec<CaseRecord>> {
+    pub fn list_tasks(&self, req: ListTasksRequest) -> Result<Vec<TaskRecord>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let mut stmt = conn.prepare(&format!(
-            "SELECT run_id, batch_name, input_digest, label, status, attempt, input_json,
-                    output_json, error_json, started_at, completed_at
-             FROM batch_cases
-             WHERE run_id = ?1 AND batch_name = ?2
+            "SELECT run_id, dataset_name, input_digest, label, category, status, attempt,
+                    input_json, output_json, error_json, started_at, completed_at
+             FROM tasks
+             WHERE run_id = ?1 AND dataset_name = ?2
                AND (?3 = '[]' OR status IN (SELECT value FROM json_each(?3)))
+               AND (?4 = '[]' OR category IN (SELECT value FROM json_each(?4)))
                AND {CURRENT_GENERATION}
              ORDER BY position"
         ))?;
         let statuses = serde_json::to_string(&req.statuses)?;
-        let rows = stmt.query_map(params![req.run_id, req.batch_name, statuses], case_from_row)?;
+        let categories = serde_json::to_string(&req.categories)?;
+        let rows = stmt.query_map(
+            params![req.run_id, req.dataset_name, statuses, categories],
+            task_from_row,
+        )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::Sqlite)
     }
 
-    pub fn batch_summary(&self, run_id: &str, batch_name: &str) -> Result<BatchSummary> {
+    pub fn dataset_summary(&self, run_id: &str, dataset_name: &str) -> Result<DatasetSummary> {
         let counts = self.counts(
             &format!(
-                "SELECT status, COUNT(*) FROM batch_cases
-                 WHERE run_id = ?1 AND batch_name = ?2 AND {CURRENT_GENERATION}
+                "SELECT status, COUNT(*) FROM tasks
+                 WHERE run_id = ?1 AND dataset_name = ?2 AND {CURRENT_GENERATION}
                  GROUP BY status"
             ),
-            params![run_id, batch_name],
+            params![run_id, dataset_name],
         )?;
-        Ok(BatchSummary {
+        Ok(DatasetSummary {
             total: counts.values().sum(),
             pending: *counts.get("pending").unwrap_or(&0),
             running: *counts.get("running").unwrap_or(&0),
@@ -486,47 +491,6 @@ impl SqliteStore {
             .map_err(Error::Sqlite)
     }
 
-    pub fn register_worker(&self, req: RegisterWorkerRequest) -> Result<WorkerRecord> {
-        let resources = serde_json::to_string(&req.resources)?;
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        conn.execute(
-            "INSERT INTO workers (worker_id, hostname, process_id, resources_json, heartbeat_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))
-             ON CONFLICT(worker_id) DO UPDATE SET
-                hostname = excluded.hostname,
-                process_id = excluded.process_id,
-                resources_json = excluded.resources_json,
-                heartbeat_at = datetime('now')",
-            params![req.worker_id, req.hostname, req.process_id, resources],
-        )?;
-        Ok(WorkerRecord {
-            worker_id: req.worker_id,
-            hostname: req.hostname,
-            process_id: req.process_id,
-            resources: req.resources,
-            heartbeat_at: now(),
-        })
-    }
-
-    pub fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT worker_id, hostname, process_id, resources_json, heartbeat_at
-             FROM workers ORDER BY worker_id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(WorkerRecord {
-                worker_id: row.get(0)?,
-                hostname: row.get(1)?,
-                process_id: row.get(2)?,
-                resources: parse_required(row.get::<_, String>(3)?)?,
-                heartbeat_at: row.get(4)?,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::Sqlite)
-    }
-
     pub fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let updated = conn.execute(
@@ -552,19 +516,19 @@ impl SqliteStore {
         let event_index: u32 = conn.query_row(
             "SELECT COALESCE(MAX(event_index), 0) + 1
              FROM trace_events
-             WHERE run_id = ?1 AND batch_name = ?2 AND case_id = ?3 AND attempt = ?4",
-            params![req.run_id, req.batch_name, req.case_id, req.attempt],
+             WHERE run_id = ?1 AND dataset_name = ?2 AND task_id = ?3 AND attempt = ?4",
+            params![req.run_id, req.dataset_name, req.task_id, req.attempt],
             |row| row.get(0),
         )?;
         conn.execute(
             "INSERT INTO trace_events
-             (run_id, batch_name, case_id, attempt, event_index, event_type,
+             (run_id, dataset_name, task_id, attempt, event_index, event_type,
               payload_json, artifact_ids_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))",
             params![
                 req.run_id,
-                req.batch_name,
-                req.case_id,
+                req.dataset_name,
+                req.task_id,
                 req.attempt,
                 event_index,
                 req.event_type,
@@ -575,8 +539,8 @@ impl SqliteStore {
         Ok(TraceEventRecord {
             id: conn.last_insert_rowid(),
             run_id: req.run_id,
-            batch_name: req.batch_name,
-            case_id: req.case_id,
+            dataset_name: req.dataset_name,
+            task_id: req.task_id,
             attempt: req.attempt,
             event_index,
             event_type: req.event_type,
@@ -589,46 +553,20 @@ impl SqliteStore {
     pub fn list_trace_events(
         &self,
         run_id: &str,
-        batch_name: &str,
-        case_id: &str,
+        dataset_name: &str,
+        task_id: &str,
     ) -> Result<Vec<TraceEventRecord>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, run_id, batch_name, case_id, attempt, event_index, event_type,
+            "SELECT id, run_id, dataset_name, task_id, attempt, event_index, event_type,
                     payload_json, artifact_ids_json, created_at
              FROM trace_events
-             WHERE run_id = ?1 AND batch_name = ?2 AND case_id = ?3
+             WHERE run_id = ?1 AND dataset_name = ?2 AND task_id = ?3
              ORDER BY attempt, event_index",
         )?;
-        let rows = stmt.query_map(params![run_id, batch_name, case_id], trace_from_row)?;
+        let rows = stmt.query_map(params![run_id, dataset_name, task_id], trace_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::Sqlite)
-    }
-
-    pub fn mark_reviewed(&self, req: ReviewRequest) -> Result<ReviewRecord> {
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        conn.execute(
-            "INSERT INTO reviews
-             (run_id, batch_name, case_id, reviewer, decision, note, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
-            params![
-                req.run_id,
-                req.batch_name,
-                req.case_id,
-                req.reviewer,
-                review_to_str(&req.decision),
-                req.note
-            ],
-        )?;
-        Ok(ReviewRecord {
-            run_id: req.run_id,
-            batch_name: req.batch_name,
-            case_id: req.case_id,
-            reviewer: req.reviewer,
-            decision: req.decision,
-            note: req.note,
-            timestamp: now(),
-        })
     }
 
     pub fn memo_get(&self, req: MemoGetRequest) -> Result<MemoGetResponse> {
@@ -698,9 +636,9 @@ impl SqliteStore {
                 "SELECT status, COUNT(*) FROM step_states WHERE run_id = ?1 GROUP BY status",
                 params![req.run_id.clone()],
             )?,
-            case_counts: self.counts(
+            task_counts: self.counts(
                 &format!(
-                    "SELECT status, COUNT(*) FROM batch_cases
+                    "SELECT status, COUNT(*) FROM tasks
                      WHERE run_id = ?1 AND {CURRENT_GENERATION}
                      GROUP BY status"
                 ),
@@ -727,15 +665,15 @@ impl SqliteStore {
                     &self.summary(SummaryRequest { run_id: req.run_id })?,
                 )?,
             }),
-            ExportKind::CaseResultsJsonl => {
+            ExportKind::TaskResultsJsonl => {
                 let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT run_id, batch_name, input_digest, label, status, attempt, input_json,
-                            output_json, error_json, started_at, completed_at
-                     FROM batch_cases WHERE run_id = ?1 AND {CURRENT_GENERATION}
-                     ORDER BY batch_name, position"
+                    "SELECT run_id, dataset_name, input_digest, label, category, status, attempt,
+                            input_json, output_json, error_json, started_at, completed_at
+                     FROM tasks WHERE run_id = ?1 AND {CURRENT_GENERATION}
+                     ORDER BY dataset_name, position"
                 ))?;
-                let rows = stmt.query_map(params![req.run_id], case_from_row)?;
+                let rows = stmt.query_map(params![req.run_id], task_from_row)?;
                 let mut body = String::new();
                 for row in rows {
                     body.push_str(&serde_json::to_string(&row?)?);
@@ -783,8 +721,8 @@ impl SqliteStore {
                 for (status, count) in summary.step_counts {
                     body.push_str(&format!("steps,{status},{count}\n"));
                 }
-                for (status, count) in summary.case_counts {
-                    body.push_str(&format!("cases,{status},{count}\n"));
+                for (status, count) in summary.task_counts {
+                    body.push_str(&format!("tasks,{status},{count}\n"));
                 }
                 Ok(ExportResponse {
                     content_type: "text/csv".to_string(),
@@ -840,14 +778,6 @@ impl SqliteStore {
 
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        // Legacy schema keyed batch_cases by user-supplied case_id; rename it aside so the
-        // content-addressed table can be created, then carry rows over below.
-        let legacy_batch_cases: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('batch_cases') WHERE name = 'case_id'")?
-            .exists([])?;
-        if legacy_batch_cases {
-            conn.execute_batch("ALTER TABLE batch_cases RENAME TO batch_cases_legacy;")?;
-        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
@@ -906,17 +836,18 @@ impl SqliteStore {
                 valid INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS batches (
+            CREATE TABLE IF NOT EXISTS datasets (
                 run_id TEXT NOT NULL,
-                batch_name TEXT NOT NULL,
+                dataset_name TEXT NOT NULL,
                 generation INTEGER NOT NULL,
-                PRIMARY KEY (run_id, batch_name)
+                PRIMARY KEY (run_id, dataset_name)
             );
-            CREATE TABLE IF NOT EXISTS batch_cases (
+            CREATE TABLE IF NOT EXISTS tasks (
                 run_id TEXT NOT NULL,
-                batch_name TEXT NOT NULL,
+                dataset_name TEXT NOT NULL,
                 input_digest TEXT NOT NULL,
                 label TEXT,
+                category TEXT,
                 position INTEGER NOT NULL,
                 generation INTEGER NOT NULL DEFAULT 1,
                 input_json TEXT NOT NULL,
@@ -928,7 +859,7 @@ impl SqliteStore {
                 completed_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY (run_id, batch_name, input_digest)
+                PRIMARY KEY (run_id, dataset_name, input_digest)
             );
             CREATE TABLE IF NOT EXISTS memos (
                 run_id TEXT NOT NULL,
@@ -946,18 +877,11 @@ impl SqliteStore {
                 digest TEXT NOT NULL,
                 PRIMARY KEY (run_id, dimension, name)
             );
-            CREATE TABLE IF NOT EXISTS workers (
-                worker_id TEXT PRIMARY KEY,
-                hostname TEXT,
-                process_id INTEGER,
-                resources_json TEXT NOT NULL,
-                heartbeat_at TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS trace_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
-                batch_name TEXT NOT NULL,
-                case_id TEXT NOT NULL,
+                dataset_name TEXT NOT NULL,
+                task_id TEXT NOT NULL,
                 attempt INTEGER NOT NULL,
                 event_index INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
@@ -965,46 +889,13 @@ impl SqliteStore {
                 artifact_ids_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL,
-                batch_name TEXT NOT NULL,
-                case_id TEXT NOT NULL,
-                reviewer TEXT NOT NULL,
-                decision TEXT NOT NULL,
-                note TEXT,
-                timestamp TEXT NOT NULL
-            );
             CREATE INDEX IF NOT EXISTS idx_failure_records_run ON failure_records (run_id);
             CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts (run_id);
-            CREATE INDEX IF NOT EXISTS idx_trace_events_case
-                ON trace_events (run_id, batch_name, case_id, attempt, event_index);
+            CREATE INDEX IF NOT EXISTS idx_trace_events_task
+                ON trace_events (run_id, dataset_name, task_id, attempt, event_index);
             CREATE UNIQUE INDEX IF NOT EXISTS uq_trace_events_index
-                ON trace_events (run_id, batch_name, case_id, attempt, event_index);
-            CREATE INDEX IF NOT EXISTS idx_reviews_run ON reviews (run_id);",
+                ON trace_events (run_id, dataset_name, task_id, attempt, event_index);",
         )?;
-        // Older databases predate the retry_at backoff column; add it in place.
-        let has_retry_at: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('step_states') WHERE name = 'retry_at'")?
-            .exists([])?;
-        if !has_retry_at {
-            conn.execute_batch("ALTER TABLE step_states ADD COLUMN retry_at TEXT;")?;
-        }
-        if legacy_batch_cases {
-            conn.execute_batch(
-                "INSERT OR IGNORE INTO batch_cases
-                   (run_id, batch_name, input_digest, label, position, generation, input_json,
-                    status, attempt, output_json, error_json, started_at, completed_at,
-                    created_at, updated_at)
-                 SELECT run_id, batch_name, input_digest, case_id, position, 1, input_json,
-                        status, attempt, output_json, error_json, started_at, completed_at,
-                        created_at, updated_at
-                 FROM batch_cases_legacy ORDER BY position;
-                 INSERT OR IGNORE INTO batches (run_id, batch_name, generation)
-                 SELECT DISTINCT run_id, batch_name, 1 FROM batch_cases_legacy;
-                 DROP TABLE batch_cases_legacy;",
-            )?;
-        }
         Ok(())
     }
 }
@@ -1022,29 +913,23 @@ impl Store for SqliteStore {
     fn fail_step(&self, req: FailStepRequest) -> Result<()> {
         self.fail_step(req)
     }
-    fn register_batch(&self, req: RegisterBatchRequest) -> Result<BatchSummary> {
-        self.register_batch(req)
+    fn register_dataset(&self, req: RegisterDatasetRequest) -> Result<DatasetSummary> {
+        self.register_dataset(req)
     }
-    fn complete_case(&self, req: CompleteCaseRequest) -> Result<()> {
-        self.complete_case(req)
+    fn complete_task(&self, req: CompleteTaskRequest) -> Result<()> {
+        self.complete_task(req)
     }
-    fn fail_case(&self, req: FailCaseRequest) -> Result<()> {
-        self.fail_case(req)
+    fn fail_task(&self, req: FailTaskRequest) -> Result<()> {
+        self.fail_task(req)
     }
-    fn list_cases(&self, req: ListCasesRequest) -> Result<Vec<CaseRecord>> {
-        self.list_cases(req)
+    fn list_tasks(&self, req: ListTasksRequest) -> Result<Vec<TaskRecord>> {
+        self.list_tasks(req)
     }
     fn register_variants(&self, req: RegisterVariantsRequest) -> Result<Vec<VariantRecord>> {
         self.register_variants(req)
     }
     fn list_variants(&self, run_id: &str) -> Result<Vec<VariantRecord>> {
         self.list_variants(run_id)
-    }
-    fn register_worker(&self, req: RegisterWorkerRequest) -> Result<WorkerRecord> {
-        self.register_worker(req)
-    }
-    fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
-        self.list_workers()
     }
     fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
         self.heartbeat_step(req)
@@ -1055,13 +940,10 @@ impl Store for SqliteStore {
     fn list_trace_events(
         &self,
         run_id: &str,
-        batch_name: &str,
-        case_id: &str,
+        dataset_name: &str,
+        task_id: &str,
     ) -> Result<Vec<TraceEventRecord>> {
-        self.list_trace_events(run_id, batch_name, case_id)
-    }
-    fn mark_reviewed(&self, req: ReviewRequest) -> Result<ReviewRecord> {
-        self.mark_reviewed(req)
+        self.list_trace_events(run_id, dataset_name, task_id)
     }
     fn memo_get(&self, req: MemoGetRequest) -> Result<MemoGetResponse> {
         self.memo_get(req)
@@ -1077,19 +959,20 @@ impl Store for SqliteStore {
     }
 }
 
-fn case_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CaseRecord> {
-    Ok(CaseRecord {
+fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
+    Ok(TaskRecord {
         run_id: row.get(0)?,
-        batch_name: row.get(1)?,
+        dataset_name: row.get(1)?,
         input_digest: row.get(2)?,
         label: row.get(3)?,
-        status: row.get(4)?,
-        attempt: row.get(5)?,
-        input: parse_required(row.get::<_, String>(6)?)?,
-        output: parse_optional(row.get::<_, Option<String>>(7)?)?,
-        error: parse_optional(row.get::<_, Option<String>>(8)?)?,
-        started_at: row.get(9)?,
-        completed_at: row.get(10)?,
+        category: row.get(4)?,
+        status: row.get(5)?,
+        attempt: row.get(6)?,
+        input: parse_required(row.get::<_, String>(7)?)?,
+        output: parse_optional(row.get::<_, Option<String>>(8)?)?,
+        error: parse_optional(row.get::<_, Option<String>>(9)?)?,
+        started_at: row.get(10)?,
+        completed_at: row.get(11)?,
     })
 }
 
@@ -1097,8 +980,8 @@ fn trace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceEventRecord>
     Ok(TraceEventRecord {
         id: row.get(0)?,
         run_id: row.get(1)?,
-        batch_name: row.get(2)?,
-        case_id: row.get(3)?,
+        dataset_name: row.get(2)?,
+        task_id: row.get(3)?,
         attempt: row.get(4)?,
         event_index: row.get(5)?,
         event_type: row.get(6)?,
@@ -1183,23 +1066,23 @@ fn csv_field(value: &str) -> String {
     }
 }
 
+fn failure_class_to_str(class: &FailureClass) -> &'static str {
+    match class {
+        FailureClass::Transient => "transient",
+        FailureClass::ResourceUnavailable => "resource_unavailable",
+        FailureClass::EvalException => "eval_exception",
+        FailureClass::DurableHarnessError => "durable_harness_error",
+        FailureClass::ArtifactError => "artifact_error",
+    }
+}
+
 fn parse_failure_class(value: String) -> FailureClass {
     match value.as_str() {
         "transient" => FailureClass::Transient,
         "resource_unavailable" => FailureClass::ResourceUnavailable,
-        "terminal_eval" => FailureClass::TerminalEval,
-        "runner_error" => FailureClass::RunnerError,
+        "durable_harness_error" => FailureClass::DurableHarnessError,
         "artifact_error" => FailureClass::ArtifactError,
-        _ => FailureClass::UserCodeError,
-    }
-}
-
-fn review_to_str(decision: &ReviewDecision) -> &'static str {
-    match decision {
-        ReviewDecision::PendingReview => "pending_review",
-        ReviewDecision::ReviewedPass => "reviewed_pass",
-        ReviewDecision::ReviewedFail => "reviewed_fail",
-        ReviewDecision::ReviewedExcluded => "reviewed_excluded",
+        _ => FailureClass::EvalException,
     }
 }
 
@@ -1282,30 +1165,51 @@ mod tests {
         ));
     }
 
-    fn case(digest: &str, input: Value) -> BatchCaseInput {
-        BatchCaseInput {
+    fn task(digest: &str, input: Value) -> DatasetTaskInput {
+        DatasetTaskInput {
             input_digest: digest.to_string(),
             input,
             label: None,
+            category: None,
         }
     }
 
-    fn register(store: &SqliteStore, cases: Vec<BatchCaseInput>) -> BatchSummary {
+    fn categorized(digest: &str, input: Value, category: &str) -> DatasetTaskInput {
+        DatasetTaskInput {
+            input_digest: digest.to_string(),
+            input,
+            label: None,
+            category: Some(category.to_string()),
+        }
+    }
+
+    fn register(store: &SqliteStore, tasks: Vec<DatasetTaskInput>) -> DatasetSummary {
         store
-            .register_batch(RegisterBatchRequest {
+            .register_dataset(RegisterDatasetRequest {
                 run_id: "run".to_string(),
-                batch_name: "batch".to_string(),
-                cases,
+                dataset_name: "dataset".to_string(),
+                tasks,
             })
-            .expect("register batch")
+            .expect("register dataset")
+    }
+
+    fn list(store: &SqliteStore, statuses: Vec<String>, categories: Vec<String>) -> Vec<TaskRecord> {
+        store
+            .list_tasks(ListTasksRequest {
+                run_id: "run".to_string(),
+                dataset_name: "dataset".to_string(),
+                statuses,
+                categories,
+            })
+            .expect("list tasks")
     }
 
     #[test]
-    fn identical_inputs_collapse_to_one_case() {
+    fn identical_inputs_collapse_to_one_task() {
         let store = store();
         let summary = register(
             &store,
-            vec![case("a", json!({"x": 1})), case("a", json!({"x": 1}))],
+            vec![task("a", json!({"x": 1})), task("a", json!({"x": 1}))],
         );
         assert_eq!(summary.total, 1);
         assert_eq!(summary.pending, 1);
@@ -1314,41 +1218,53 @@ mod tests {
     #[test]
     fn changed_input_invalidates_and_revert_reuses_output() {
         let store = store();
-        register(&store, vec![case("a", json!({"x": 1}))]);
+        register(&store, vec![task("a", json!({"x": 1}))]);
         store
-            .complete_case(CompleteCaseRequest {
+            .complete_task(CompleteTaskRequest {
                 run_id: "run".to_string(),
-                batch_name: "batch".to_string(),
+                dataset_name: "dataset".to_string(),
                 input_digest: "a".to_string(),
                 output: json!({"ok": true}),
             })
-            .expect("complete case");
+            .expect("complete task");
 
-        // Edited input gets a fresh pending case; the stale success no longer counts.
-        let summary = register(&store, vec![case("b", json!({"x": 2}))]);
+        // Edited input gets a fresh pending task; the stale success no longer counts.
+        let summary = register(&store, vec![task("b", json!({"x": 2}))]);
         assert_eq!(summary.total, 1);
         assert_eq!(summary.pending, 1);
         assert_eq!(summary.succeeded, 0);
 
         // Reverting to the original input salvages its completed output.
-        let summary = register(&store, vec![case("a", json!({"x": 1}))]);
+        let summary = register(&store, vec![task("a", json!({"x": 1}))]);
         assert_eq!(summary.total, 1);
         assert_eq!(summary.succeeded, 1);
-        let cases = store
-            .list_cases(ListCasesRequest {
-                run_id: "run".to_string(),
-                batch_name: "batch".to_string(),
-                statuses: vec![],
-            })
-            .expect("list cases");
-        assert_eq!(cases.len(), 1);
-        assert_eq!(cases[0].output, Some(json!({"ok": true})));
+        let tasks = list(&store, vec![], vec![]);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].output, Some(json!({"ok": true})));
     }
 
-    fn fail_case_req(max_attempts: u32) -> FailCaseRequest {
-        FailCaseRequest {
+    #[test]
+    fn list_tasks_filters_by_category() {
+        let store = store();
+        register(
+            &store,
+            vec![
+                categorized("a", json!({"x": 1}), "math"),
+                categorized("b", json!({"x": 2}), "code"),
+                categorized("c", json!({"x": 3}), "math"),
+            ],
+        );
+        let math = list(&store, vec![], vec!["math".to_string()]);
+        assert_eq!(math.len(), 2);
+        assert!(math.iter().all(|t| t.category.as_deref() == Some("math")));
+        let all = list(&store, vec![], vec![]);
+        assert_eq!(all.len(), 3);
+    }
+
+    fn fail_task_req(max_attempts: u32) -> FailTaskRequest {
+        FailTaskRequest {
             run_id: "run".to_string(),
-            batch_name: "batch".to_string(),
+            dataset_name: "dataset".to_string(),
             input_digest: "a".to_string(),
             error: ErrorInfo {
                 error_type: "RuntimeError".to_string(),
@@ -1362,29 +1278,17 @@ mod tests {
     }
 
     #[test]
-    fn case_goes_terminal_after_max_attempts() {
+    fn task_goes_terminal_after_max_attempts() {
         let store = store();
-        register(&store, vec![case("a", json!({"x": 1}))]);
+        register(&store, vec![task("a", json!({"x": 1}))]);
 
-        store.fail_case(fail_case_req(2)).expect("first failure");
-        let failed = store
-            .list_cases(ListCasesRequest {
-                run_id: "run".to_string(),
-                batch_name: "batch".to_string(),
-                statuses: vec!["failed".to_string()],
-            })
-            .expect("list failed");
+        store.fail_task(fail_task_req(2)).expect("first failure");
+        let failed = list(&store, vec!["failed".to_string()], vec![]);
         assert_eq!(failed.len(), 1, "first failure stays retryable");
         assert_eq!(failed[0].attempt, 1);
 
-        store.fail_case(fail_case_req(2)).expect("second failure");
-        let terminal = store
-            .list_cases(ListCasesRequest {
-                run_id: "run".to_string(),
-                batch_name: "batch".to_string(),
-                statuses: vec!["terminal".to_string()],
-            })
-            .expect("list terminal");
+        store.fail_task(fail_task_req(2)).expect("second failure");
+        let terminal = list(&store, vec!["terminal".to_string()], vec![]);
         assert_eq!(terminal.len(), 1, "ceiling reached marks terminal");
         assert_eq!(terminal[0].attempt, 2);
     }

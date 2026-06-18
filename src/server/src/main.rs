@@ -31,22 +31,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/steps/complete", post(complete_step))
         .route("/steps/fail", post(fail_step))
         .route("/steps/heartbeat", post(heartbeat_step))
-        .route("/batches/register", post(register_batch))
-        .route("/batches/cases/list", post(list_cases))
-        .route("/batches/cases/complete", post(complete_case))
-        .route("/batches/cases/fail", post(fail_case))
+        .route("/datasets/register", post(register_dataset))
+        .route("/datasets/tasks/list", post(list_tasks))
+        .route("/datasets/tasks/complete", post(complete_task))
+        .route("/datasets/tasks/fail", post(fail_task))
         .route("/variants/register", post(register_variants))
         .route("/variants/:run_id", get(list_variants))
-        .route("/workers/register", post(register_worker))
-        .route("/workers", get(list_workers))
         .route("/traces/events", post(add_trace_event))
         .route(
-            "/traces/:run_id/:batch_name/:case_id",
+            "/traces/:run_id/:dataset_name/:task_id",
             get(list_trace_events),
         )
         .route("/memos/get", post(memo_get))
         .route("/memos/put", post(memo_put))
-        .route("/reviews", post(mark_reviewed))
         .layer(middleware::from_fn_with_state(token, require_token))
         .with_state(runtime);
 
@@ -81,7 +78,7 @@ async fn require_token(
                     Json(ErrorInfo {
                         error_type: "Unauthorized".to_string(),
                         message: "missing or invalid bearer token".to_string(),
-                        failure_class: FailureClass::RunnerError,
+                        failure_class: FailureClass::DurableHarnessError,
                         stack: None,
                         retryable: Some(false),
                     }),
@@ -94,18 +91,6 @@ async fn require_token(
 }
 
 fn build_runtime(db: &str) -> anyhow::Result<Runtime> {
-    if db.starts_with("postgres://") || db.starts_with("postgresql://") {
-        #[cfg(feature = "postgres")]
-        {
-            return Ok(Runtime::new(PostgresStore::connect(db)?));
-        }
-        #[cfg(not(feature = "postgres"))]
-        {
-            anyhow::bail!(
-                "DURABLE_EVALS_DB requests postgres but the server was built without the `postgres` feature"
-            );
-        }
-    }
     if let Some(parent) = std::path::Path::new(db).parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -165,36 +150,36 @@ async fn heartbeat_step(
         .map_err(store_error)
 }
 
-async fn register_batch(
+async fn register_dataset(
     State(runtime): State<Runtime>,
-    Json(req): Json<RegisterBatchRequest>,
-) -> Result<Json<BatchSummary>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime.register_batch(req).map(Json).map_err(store_error)
+    Json(req): Json<RegisterDatasetRequest>,
+) -> Result<Json<DatasetSummary>, (axum::http::StatusCode, Json<ErrorInfo>)> {
+    runtime.register_dataset(req).map(Json).map_err(store_error)
 }
 
-async fn list_cases(
+async fn list_tasks(
     State(runtime): State<Runtime>,
-    Json(req): Json<ListCasesRequest>,
-) -> Result<Json<Vec<CaseRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime.list_cases(req).map(Json).map_err(store_error)
+    Json(req): Json<ListTasksRequest>,
+) -> Result<Json<Vec<TaskRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
+    runtime.list_tasks(req).map(Json).map_err(store_error)
 }
 
-async fn complete_case(
+async fn complete_task(
     State(runtime): State<Runtime>,
-    Json(req): Json<CompleteCaseRequest>,
+    Json(req): Json<CompleteTaskRequest>,
 ) -> Result<Json<Health>, (axum::http::StatusCode, Json<ErrorInfo>)> {
     runtime
-        .complete_case(req)
+        .complete_task(req)
         .map(|_| Json(Health { ok: true }))
         .map_err(store_error)
 }
 
-async fn fail_case(
+async fn fail_task(
     State(runtime): State<Runtime>,
-    Json(req): Json<FailCaseRequest>,
+    Json(req): Json<FailTaskRequest>,
 ) -> Result<Json<Health>, (axum::http::StatusCode, Json<ErrorInfo>)> {
     runtime
-        .fail_case(req)
+        .fail_task(req)
         .map(|_| Json(Health { ok: true }))
         .map_err(store_error)
 }
@@ -219,19 +204,6 @@ async fn list_variants(
         .map_err(store_error)
 }
 
-async fn register_worker(
-    State(runtime): State<Runtime>,
-    Json(req): Json<RegisterWorkerRequest>,
-) -> Result<Json<WorkerRecord>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime.register_worker(req).map(Json).map_err(store_error)
-}
-
-async fn list_workers(
-    State(runtime): State<Runtime>,
-) -> Result<Json<Vec<WorkerRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime.list_workers().map(Json).map_err(store_error)
-}
-
 async fn add_trace_event(
     State(runtime): State<Runtime>,
     Json(req): Json<TraceEventRequest>,
@@ -241,10 +213,10 @@ async fn add_trace_event(
 
 async fn list_trace_events(
     State(runtime): State<Runtime>,
-    Path((run_id, batch_name, case_id)): Path<(String, String, String)>,
+    Path((run_id, dataset_name, task_id)): Path<(String, String, String)>,
 ) -> Result<Json<Vec<TraceEventRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
     runtime
-        .list_trace_events(&run_id, &batch_name, &case_id)
+        .list_trace_events(&run_id, &dataset_name, &task_id)
         .map(Json)
         .map_err(store_error)
 }
@@ -264,13 +236,6 @@ async fn memo_put(
         .memo_put(req)
         .map(|_| Json(Health { ok: true }))
         .map_err(store_error)
-}
-
-async fn mark_reviewed(
-    State(runtime): State<Runtime>,
-    Json(req): Json<ReviewRequest>,
-) -> Result<Json<ReviewRecord>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime.mark_reviewed(req).map(Json).map_err(store_error)
 }
 
 async fn summary(
@@ -295,7 +260,7 @@ fn internal_server_error<E: std::fmt::Display>(
         Json(ErrorInfo {
             error_type: "InternalServerError".to_string(),
             message: error.to_string(),
-            failure_class: FailureClass::RunnerError,
+            failure_class: FailureClass::DurableHarnessError,
             stack: None,
             retryable: Some(false),
         }),
@@ -309,17 +274,17 @@ fn store_error(error: StoreError) -> (axum::http::StatusCode, Json<ErrorInfo>) {
             Json(ErrorInfo {
                 error_type: "StepNotFound".to_string(),
                 message: error.to_string(),
-                failure_class: FailureClass::RunnerError,
+                failure_class: FailureClass::DurableHarnessError,
                 stack: None,
                 retryable: Some(false),
             }),
         ),
-        StoreError::CaseNotFound => (
+        StoreError::TaskNotFound => (
             axum::http::StatusCode::NOT_FOUND,
             Json(ErrorInfo {
-                error_type: "CaseNotFound".to_string(),
+                error_type: "TaskNotFound".to_string(),
                 message: error.to_string(),
-                failure_class: FailureClass::RunnerError,
+                failure_class: FailureClass::DurableHarnessError,
                 stack: None,
                 retryable: Some(false),
             }),

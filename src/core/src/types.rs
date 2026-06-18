@@ -55,58 +55,60 @@ pub struct RegisterRunRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchCaseInput {
+pub struct DatasetTaskInput {
     pub input_digest: String,
     #[serde(default)]
     pub input: Value,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterBatchRequest {
+pub struct RegisterDatasetRequest {
     pub run_id: String,
-    pub batch_name: String,
-    pub cases: Vec<BatchCaseInput>,
+    pub dataset_name: String,
+    pub tasks: Vec<DatasetTaskInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompleteCaseRequest {
+pub struct CompleteTaskRequest {
     pub run_id: String,
-    pub batch_name: String,
+    pub dataset_name: String,
     pub input_digest: String,
     pub output: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FailCaseRequest {
+pub struct FailTaskRequest {
     pub run_id: String,
-    pub batch_name: String,
+    pub dataset_name: String,
     pub input_digest: String,
     pub error: ErrorInfo,
-    #[serde(default = "default_case_max_attempts")]
     pub max_attempts: u32,
 }
 
-fn default_case_max_attempts() -> u32 {
-    3
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListCasesRequest {
+pub struct ListTasksRequest {
     pub run_id: String,
-    pub batch_name: String,
+    pub dataset_name: String,
     #[serde(default)]
     pub statuses: Vec<String>,
+    /// Optional category filter; empty means every category.
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CaseRecord {
+pub struct TaskRecord {
     pub run_id: String,
-    pub batch_name: String,
+    pub dataset_name: String,
     pub input_digest: String,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
     pub status: String,
     pub attempt: u32,
     pub input: Value,
@@ -117,7 +119,7 @@ pub struct CaseRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchSummary {
+pub struct DatasetSummary {
     pub total: u32,
     pub pending: u32,
     pub running: u32,
@@ -138,7 +140,8 @@ pub struct RetryPolicy {
     pub jitter: bool,
     #[serde(default = "default_retryable_classes")]
     pub retryable: Vec<FailureClass>,
-    #[serde(default = "default_terminal_classes")]
+    /// Classes forced terminal even if they also appear in `retryable`. Empty by default.
+    #[serde(default)]
     pub terminal: Vec<FailureClass>,
 }
 
@@ -150,7 +153,7 @@ impl Default for RetryPolicy {
             max_delay_ms: 0,
             jitter: false,
             retryable: default_retryable_classes(),
-            terminal: default_terminal_classes(),
+            terminal: Vec::new(),
         }
     }
 }
@@ -159,8 +162,8 @@ impl RetryPolicy {
     /// Delay in milliseconds before a failed step on `attempt` (1-based) may retry.
     /// Exponential backoff `base_delay_ms * 2^(attempt-1)`, capped at `max_delay_ms`,
     /// with optional jitter in `[0.5, 1.0)` derived from `jitter_seed` so we avoid
-    /// pulling in a random-number dependency. Returns 0 when no base delay is set,
-    /// preserving the previous immediate-retry behavior.
+    /// pulling in a random-number dependency. A `base_delay_ms` of 0 disables backoff
+    /// and the step retries immediately.
     pub fn backoff_delay_ms(&self, attempt: u32, jitter_seed: u64) -> u64 {
         if self.base_delay_ms == 0 {
             return 0;
@@ -187,28 +190,31 @@ fn default_retryable_classes() -> Vec<FailureClass> {
     vec![
         FailureClass::Transient,
         FailureClass::ResourceUnavailable,
-        FailureClass::UserCodeError,
+        FailureClass::EvalException,
     ]
-}
-
-fn default_terminal_classes() -> Vec<FailureClass> {
-    vec![FailureClass::TerminalEval]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
+    /// An ephemeral hiccup (network blip, HTTP 500). Retrying will likely succeed.
     Transient,
+    /// A dependency is temporarily down or exhausted (store unreachable, quota hit,
+    /// filesystem unavailable). Retry later.
     ResourceUnavailable,
-    TerminalEval,
-    UserCodeError,
-    RunnerError,
+    /// An exception raised inside the user's eval/step callback.
+    EvalException,
+    /// A failure in the durable-evals harness itself (runtime/server, serialization,
+    /// orchestration). Not the eval's fault; terminal by default.
+    DurableHarnessError,
+    /// A deterministic artifact failure such as a hash mismatch or corrupt content.
+    /// Transient storage outages should be reported as `ResourceUnavailable` instead.
     ArtifactError,
 }
 
 impl Default for FailureClass {
     fn default() -> Self {
-        Self::UserCodeError
+        Self::EvalException
     }
 }
 
@@ -294,26 +300,6 @@ pub struct VariantRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterWorkerRequest {
-    pub worker_id: String,
-    #[serde(default)]
-    pub hostname: Option<String>,
-    #[serde(default)]
-    pub process_id: Option<u32>,
-    #[serde(default)]
-    pub resources: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerRecord {
-    pub worker_id: String,
-    pub hostname: Option<String>,
-    pub process_id: Option<u32>,
-    pub resources: Value,
-    pub heartbeat_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatStepRequest {
     pub run_id: String,
     pub step_name: String,
@@ -325,8 +311,8 @@ pub struct HeartbeatStepRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEventRequest {
     pub run_id: String,
-    pub batch_name: String,
-    pub case_id: String,
+    pub dataset_name: String,
+    pub task_id: String,
     pub attempt: u32,
     pub event_type: String,
     #[serde(default)]
@@ -339,45 +325,14 @@ pub struct TraceEventRequest {
 pub struct TraceEventRecord {
     pub id: i64,
     pub run_id: String,
-    pub batch_name: String,
-    pub case_id: String,
+    pub dataset_name: String,
+    pub task_id: String,
     pub attempt: u32,
     pub event_index: u32,
     pub event_type: String,
     pub payload: Value,
     pub artifact_ids: Vec<String>,
     pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewRequest {
-    pub run_id: String,
-    pub batch_name: String,
-    pub case_id: String,
-    pub reviewer: String,
-    pub decision: ReviewDecision,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewDecision {
-    PendingReview,
-    ReviewedPass,
-    ReviewedFail,
-    ReviewedExcluded,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewRecord {
-    pub run_id: String,
-    pub batch_name: String,
-    pub case_id: String,
-    pub reviewer: String,
-    pub decision: ReviewDecision,
-    pub note: Option<String>,
-    pub timestamp: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,7 +370,7 @@ pub struct RunSummary {
     pub config: Value,
     pub config_digest: String,
     pub step_counts: BTreeMap<String, u32>,
-    pub case_counts: BTreeMap<String, u32>,
+    pub task_counts: BTreeMap<String, u32>,
     pub artifact_count: u32,
     pub failure_counts: BTreeMap<String, u32>,
     pub started_at: Option<String>,
@@ -432,7 +387,7 @@ pub struct ExportRequest {
 #[serde(rename_all = "snake_case")]
 pub enum ExportKind {
     ManifestJson,
-    CaseResultsJsonl,
+    TaskResultsJsonl,
     FailureReportJson,
     FailureReportCsv,
     AggregateMetricsJson,
