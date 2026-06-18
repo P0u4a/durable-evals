@@ -12,8 +12,10 @@ The goal of this library is to alleviate some of this pain by providing a mechan
 
 ## How it works
 
-A case is a specific task in the eval. Cases are content-addressed: a case's identity is the hash of its input. Re-running a script reuses completed outputs, editing an input automatically invalidates just that case, and reverting the edit restores the original cached output. Identical
-inputs collapse to a single case (add e.g. a `sample` field to the input for repeated sampling). The optional `id` callback only provides a human-readable label.
+A task is a single datapoint in the eval. Tasks are content-addressed: a task's identity is the hash of its input. Re-running a script reuses completed outputs, editing an input automatically invalidates just that task, and reverting the edit restores the original cached output. Identical
+inputs collapse to a single task (add e.g. a `sample` field to the input for repeated sampling). The optional `id` callback only provides a human-readable label.
+
+A dataset is a collection of tasks. Tasks may carry an optional `category`, so you can filter a run to only certain categories.
 
 A step is a single unit of work that is part of an eval's method. For example, scoring is a step.
 
@@ -30,26 +32,37 @@ eval_run = DurableEval(
     config={"model": "gpt-5.5"},
 )
 
-cases = [{"id": "case-1", "prompt": "hello"}]
+tasks = [{"id": "task-1", "prompt": "hello", "category": "greeting"}]
 
-results = eval_run.batch("infer_cases", cases).map(
-    id=lambda case: case["id"],  # optional label
-    run=lambda case: {"case_id": case["id"], "answer": "ok"},
+results = eval_run.dataset("infer_tasks", tasks).map(
+    id=lambda task: task["id"],  # optional label
+    category=lambda task: task["category"],  # optional category
+    run=lambda task: {"task_id": task["id"], "answer": "ok"},
     concurrency=4,
 )
 
 print(eval_run.summary())
 ```
 
-Wrap individual model calls in `memo` for sub-case recovery: a crashed multi-turn
-case replays its earlier calls from storage instead of re-paying for them.
+Pass `categories=[...]` to `map` to run only tasks in those categories:
 
 ```python
-def run_case(case):
-    messages = [{"role": "user", "content": case["prompt"]}]
+results = eval_run.dataset("infer_tasks", tasks).map(
+    run=run_task,
+    category=lambda task: task["category"],
+    categories=["greeting"],  # only run these categories
+)
+```
+
+Wrap individual model calls in `memo` for sub-task recovery: a crashed multi-turn
+task replays its earlier calls from storage instead of re-paying for them.
+
+```python
+def run_task(task):
+    messages = [{"role": "user", "content": task["prompt"]}]
     for turn in range(10):
         response = eval_run.memo(
-            {"case": case, "turn": turn, "messages": messages},
+            {"task": task, "turn": turn, "messages": messages},
             lambda: call_model(messages),
         )
         messages = advance(messages, response)
@@ -62,24 +75,23 @@ Durable steps are useful for shared setup, scoring, and aggregation:
 class MyEval(DurableEval):
     @step(name="prepare_data")
     def prepare_data(self):
-        return [{"id": "case-1"}]
+        return [{"id": "task-1"}]
 
     @step(
         name="score",
         retry={
             "max_attempts": 3,
             "retryable": ["transient", "resource_unavailable"],
-            "terminal": ["terminal_eval"],
         },
     )
     def score(self, results):
         return {"total": len(results)}
 ```
 
-Trace a multi-turn case (pass the case input; its digest keys the trace):
+Trace a multi-turn task (pass the task input; its digest keys the trace):
 
 ```python
-with eval_run.trace_case("browser_tasks", case=case) as trace:
+with eval_run.trace_task("browser_tasks", task=task) as trace:
     trace.model_request({"messages": []})
     trace.tool_call({"name": "browser.click"})
     trace.tool_result({"ok": True})
@@ -97,22 +109,24 @@ const evalRun = new DurableEval({
   config: { model: "gpt-5.5" },
 });
 
-const cases = [{ id: "case-1", prompt: "hello" }];
+const tasks = [{ id: "task-1", prompt: "hello", category: "greeting" }];
 
-const results = await evalRun.batch("inferCases", cases).map({
-  id: (testCase) => testCase.id, // optional label
-  run: async (testCase) => ({ caseId: testCase.id, answer: "ok" }),
+const results = await evalRun.dataset("inferTasks", tasks).map({
+  id: (task) => task.id, // optional label
+  category: (task) => task.category, // optional category
+  categories: ["greeting"], // optional: only run these categories
+  run: async (task) => ({ taskId: task.id, answer: "ok" }),
   concurrency: 4,
 });
 
 console.log(await evalRun.summary());
 ```
 
-Memoize individual model calls for sub-case recovery:
+Memoize individual model calls for sub-task recovery:
 
 ```ts
 const response = await evalRun.memo(
-  { case: testCase, turn, messages },
+  { task, turn, messages },
   () => callModel(messages),
 );
 ```
@@ -120,7 +134,7 @@ const response = await evalRun.memo(
 Durable steps:
 
 ```ts
-const prepareData = evalRun.step("prepareData", async () => [{ id: "case-1" }]);
+const prepareData = evalRun.step("prepareData", async () => [{ id: "task-1" }]);
 
 const score = evalRun.step(
   "score",
@@ -129,16 +143,15 @@ const score = evalRun.step(
     retry: {
       max_attempts: 3,
       retryable: ["transient", "resource_unavailable"],
-      terminal: ["terminal_eval"],
     },
   },
 );
 ```
 
-Trace a multi-turn case:
+Trace a multi-turn task:
 
 ```ts
-const trace = evalRun.traceCase("browserTasks", { case: testCase });
+const trace = evalRun.traceTask("browserTasks", { task });
 await trace.modelRequest({ messages: [] });
 await trace.toolCall({ name: "browser.click" });
 await trace.toolResult({ ok: true });
@@ -155,9 +168,7 @@ Useful environment variables:
 
 - `DURABLE_EVALS_RUNTIME_URL`: Connect to an existing runtime server.
 - `DURABLE_EVALS_SERVER_BIN`: Override the server binary path.
-- `DURABLE_EVALS_DB`: Set the SQLite database path for the server (a
-  `postgres://` / `postgresql://` URL selects the Postgres backend, which
-  requires building the server with the `postgres` feature).
+- `DURABLE_EVALS_DB`: Set the SQLite database path for the server.
 - `DURABLE_EVALS_ADDR`: Set the server bind address.
 - `DURABLE_EVALS_TOKEN`: Require `Authorization: Bearer <token>` on every
   request except `/health`. Clients read the same variable and attach the
