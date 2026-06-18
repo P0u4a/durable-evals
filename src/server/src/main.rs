@@ -9,11 +9,31 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use durable_evals_core::{Error as StoreError, *};
 
+const DEFAULT_DB: &str = ".durable/evals.sqlite";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    let mut args = env::args().skip(1);
+    match args.next().as_deref() {
+        Some("run") => run_cmd(args.collect()).await,
+        Some("serve") | None => serve_cmd().await,
+        Some(other) => {
+            eprintln!(
+                "unknown subcommand `{other}`\n\
+                 usage:\n  \
+                 durable-eval run [--fresh] [--db PATH] <harness> [args...]\n  \
+                 durable-eval serve"
+            );
+            std::process::exit(2);
+        }
+    }
+}
 
-    let db = env::var("DURABLE_EVALS_DB").unwrap_or_else(|_| ".durable/evals.sqlite".into());
+/// Run the HTTP runtime in the foreground, printing its bound address on the first
+/// stdout line so a parent process can connect.
+async fn serve_cmd() -> anyhow::Result<()> {
+    let db = env::var("DURABLE_EVALS_DB").unwrap_or_else(|_| DEFAULT_DB.into());
     let runtime = build_runtime(&db)?;
     // Optional shared-secret auth. Unset (the default) leaves the API open, which is fine
     // for the loopback-bound local runtime but should be set whenever DURABLE_EVALS_ADDR
@@ -22,40 +42,112 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .filter(|value| !value.is_empty())
         .map(Arc::new);
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/runs/register", post(register_run))
-        .route("/runs/summary", post(summary))
-        .route("/runs/export", post(export_run))
-        .route("/steps/begin", post(begin_step))
-        .route("/steps/complete", post(complete_step))
-        .route("/steps/fail", post(fail_step))
-        .route("/steps/heartbeat", post(heartbeat_step))
-        .route("/datasets/register", post(register_dataset))
-        .route("/datasets/tasks/list", post(list_tasks))
-        .route("/datasets/tasks/complete", post(complete_task))
-        .route("/datasets/tasks/fail", post(fail_task))
-        .route("/variants/register", post(register_variants))
-        .route("/variants/:run_id", get(list_variants))
-        .route("/traces/events", post(add_trace_event))
-        .route(
-            "/traces/:run_id/:dataset_name/:task_id",
-            get(list_trace_events),
-        )
-        .route("/memos/get", post(memo_get))
-        .route("/memos/put", post(memo_put))
-        .layer(middleware::from_fn_with_state(token, require_token))
-        .with_state(runtime);
-
     let addr: SocketAddr = env::var("DURABLE_EVALS_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:0".into())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let local_addr = listener.local_addr()?;
-    println!("{local_addr}");
-
-    axum::serve(listener, app).await?;
+    println!("{}", listener.local_addr()?);
+    axum::serve(listener, router(runtime, token)).await?;
     Ok(())
+}
+
+/// Launch a user eval harness with a managed runtime: start the server on a loopback
+/// port, point the harness's client at it via DURABLE_EVALS_RUNTIME_URL, and exit with
+/// the harness's status. Re-running resumes from the same database.
+async fn run_cmd(args: Vec<String>) -> anyhow::Result<()> {
+    let mut fresh = false;
+    let mut db: Option<String> = None;
+    let mut harness: Option<String> = None;
+    let mut passthrough: Vec<String> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        if harness.is_some() {
+            passthrough.push(arg);
+        } else {
+            match arg.as_str() {
+                "--fresh" => fresh = true,
+                "--db" => db = it.next(),
+                _ => harness = Some(arg),
+            }
+        }
+    }
+    let harness = harness.ok_or_else(|| {
+        anyhow::anyhow!("usage: durable-eval run [--fresh] [--db PATH] <harness> [args...]")
+    })?;
+    let db = db.unwrap_or_else(|| DEFAULT_DB.into());
+    if fresh {
+        let _ = std::fs::remove_file(&db);
+    }
+
+    let runtime = build_runtime(&db)?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    // The harness is a child process; the runtime lives for that child's lifetime.
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router(runtime, None)).await;
+    });
+
+    let (program, mut cmd_args) = interpreter_for(&harness)?;
+    cmd_args.push(harness);
+    cmd_args.extend(passthrough);
+    let status = tokio::process::Command::new(program)
+        .args(&cmd_args)
+        .env("DURABLE_EVALS_RUNTIME_URL", format!("http://{addr}"))
+        .env("DURABLE_EVALS_DB", &db)
+        .status()
+        .await?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Pick the interpreter for a harness by file extension. Python and JS run directly;
+/// TypeScript is run through the `tsx` loader, which must be installed.
+fn interpreter_for(harness: &str) -> anyhow::Result<(String, Vec<String>)> {
+    let ext = std::path::Path::new(harness)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "py" => Ok((
+            env::var("DURABLE_EVALS_PYTHON").unwrap_or_else(|_| "python".into()),
+            vec![],
+        )),
+        "js" | "mjs" | "cjs" => Ok(("node".into(), vec![])),
+        "ts" | "mts" => Ok(("node".into(), vec!["--import".into(), "tsx".into()])),
+        _ => Err(anyhow::anyhow!(
+            "don't know how to run `{harness}` (expected a .py, .js, or .ts harness)"
+        )),
+    }
+}
+
+fn router(runtime: Runtime, token: Option<Arc<String>>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/runs/register", post(register_run))
+        .route("/runs/summary", post(summary))
+        .route("/runs/export", post(export_run))
+        .route("/tasks/begin", post(begin))
+        .route("/tasks/complete", post(complete))
+        .route("/tasks/fail", post(fail))
+        .route("/tasks/list", post(list))
+        .route("/tasks/heartbeat", post(heartbeat))
+        .route("/datasets/register", post(register_dataset))
+        .route("/variants/register", post(register_variants))
+        .route("/variants/:run_id", get(list_variants))
+        .route("/traces/events", post(add_trace_event))
+        .route("/traces/:run_id/:kind/:task_id", get(list_trace_events))
+        .route("/memos/get", post(memo_get))
+        .route("/memos/put", post(memo_put))
+        .layer(middleware::from_fn_with_state(token, require_token))
+        .with_state(runtime)
+}
+
+fn build_runtime(db: &str) -> anyhow::Result<Runtime> {
+    if let Some(parent) = std::path::Path::new(db).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(Runtime::new(SqliteStore::open(db)?))
 }
 
 /// Reject requests without a matching `Authorization: Bearer <token>` when a token is
@@ -90,24 +182,15 @@ async fn require_token(
     next.run(req).await
 }
 
-fn build_runtime(db: &str) -> anyhow::Result<Runtime> {
-    if let Some(parent) = std::path::Path::new(db).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    Ok(Runtime::new(SqliteStore::open(db)?))
-}
-
 async fn health() -> Json<Health> {
     Json(Health { ok: true })
 }
 
-async fn begin_step(
+async fn begin(
     State(runtime): State<Runtime>,
-    Json(req): Json<BeginStepRequest>,
-) -> Result<Json<StepOutcome>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime.begin_step(req).map(Json).map_err(store_error)
+    Json(req): Json<BeginRequest>,
+) -> Result<Json<Outcome>, (axum::http::StatusCode, Json<ErrorInfo>)> {
+    runtime.begin(req).map(Json).map_err(store_error)
 }
 
 async fn register_run(
@@ -120,32 +203,32 @@ async fn register_run(
         .map_err(store_error)
 }
 
-async fn complete_step(
+async fn complete(
     State(runtime): State<Runtime>,
-    Json(req): Json<CompleteStepRequest>,
+    Json(req): Json<CompleteRequest>,
 ) -> Result<Json<Health>, (axum::http::StatusCode, Json<ErrorInfo>)> {
     runtime
-        .complete_step(req)
+        .complete(req)
         .map(|_| Json(Health { ok: true }))
         .map_err(store_error)
 }
 
-async fn fail_step(
+async fn fail(
     State(runtime): State<Runtime>,
-    Json(req): Json<FailStepRequest>,
+    Json(req): Json<FailRequest>,
 ) -> Result<Json<Health>, (axum::http::StatusCode, Json<ErrorInfo>)> {
     runtime
-        .fail_step(req)
+        .fail(req)
         .map(|_| Json(Health { ok: true }))
         .map_err(store_error)
 }
 
-async fn heartbeat_step(
+async fn heartbeat(
     State(runtime): State<Runtime>,
-    Json(req): Json<HeartbeatStepRequest>,
+    Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<Health>, (axum::http::StatusCode, Json<ErrorInfo>)> {
     runtime
-        .heartbeat_step(req)
+        .heartbeat(req)
         .map(|retained| Json(Health { ok: retained }))
         .map_err(store_error)
 }
@@ -157,31 +240,11 @@ async fn register_dataset(
     runtime.register_dataset(req).map(Json).map_err(store_error)
 }
 
-async fn list_tasks(
+async fn list(
     State(runtime): State<Runtime>,
-    Json(req): Json<ListTasksRequest>,
+    Json(req): Json<ListRequest>,
 ) -> Result<Json<Vec<TaskRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime.list_tasks(req).map(Json).map_err(store_error)
-}
-
-async fn complete_task(
-    State(runtime): State<Runtime>,
-    Json(req): Json<CompleteTaskRequest>,
-) -> Result<Json<Health>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime
-        .complete_task(req)
-        .map(|_| Json(Health { ok: true }))
-        .map_err(store_error)
-}
-
-async fn fail_task(
-    State(runtime): State<Runtime>,
-    Json(req): Json<FailTaskRequest>,
-) -> Result<Json<Health>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime
-        .fail_task(req)
-        .map(|_| Json(Health { ok: true }))
-        .map_err(store_error)
+    runtime.list(req).map(Json).map_err(store_error)
 }
 
 async fn register_variants(
@@ -213,10 +276,10 @@ async fn add_trace_event(
 
 async fn list_trace_events(
     State(runtime): State<Runtime>,
-    Path((run_id, dataset_name, task_id)): Path<(String, String, String)>,
+    Path((run_id, kind, task_id)): Path<(String, String, String)>,
 ) -> Result<Json<Vec<TraceEventRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
     runtime
-        .list_trace_events(&run_id, &dataset_name, &task_id)
+        .list_trace_events(&run_id, &kind, &task_id)
         .map(Json)
         .map_err(store_error)
 }
@@ -252,43 +315,22 @@ async fn export_run(
     runtime.export(req).map(Json).map_err(store_error)
 }
 
-fn internal_server_error<E: std::fmt::Display>(
-    error: E,
-) -> (axum::http::StatusCode, Json<ErrorInfo>) {
+fn store_error(error: StoreError) -> (axum::http::StatusCode, Json<ErrorInfo>) {
+    let (status, error_type) = match error {
+        StoreError::TaskNotFound => (axum::http::StatusCode::NOT_FOUND, "TaskNotFound"),
+        _ => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+        ),
+    };
     (
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        status,
         Json(ErrorInfo {
-            error_type: "InternalServerError".to_string(),
+            error_type: error_type.to_string(),
             message: error.to_string(),
             failure_class: FailureClass::DurableHarnessError,
             stack: None,
             retryable: Some(false),
         }),
     )
-}
-
-fn store_error(error: StoreError) -> (axum::http::StatusCode, Json<ErrorInfo>) {
-    match error {
-        StoreError::StepNotFound => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(ErrorInfo {
-                error_type: "StepNotFound".to_string(),
-                message: error.to_string(),
-                failure_class: FailureClass::DurableHarnessError,
-                stack: None,
-                retryable: Some(false),
-            }),
-        ),
-        StoreError::TaskNotFound => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(ErrorInfo {
-                error_type: "TaskNotFound".to_string(),
-                message: error.to_string(),
-                failure_class: FailureClass::DurableHarnessError,
-                stack: None,
-                retryable: Some(false),
-            }),
-        ),
-        error => internal_server_error(error),
-    }
 }

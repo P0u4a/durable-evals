@@ -15,26 +15,26 @@ class Runtime:
         self.completed = []
         self.failed = []
 
-    def begin_step(self, payload):
+    def begin(self, payload):
         self.began = payload
         return self.outcome
 
-    def complete_step(self, payload):
+    def complete(self, payload):
         self.completed.append(payload)
 
-    def fail_step(self, payload):
+    def fail(self, payload):
         self.failed.append(payload)
 
-    async def abegin_step(self, payload):
+    async def abegin(self, payload):
         self.async_began = True
         self.began = payload
         return self.outcome
 
-    async def acomplete_step(self, payload):
+    async def acomplete(self, payload):
         self.async_completed = True
         self.completed.append(payload)
 
-    async def afail_step(self, payload):
+    async def afail(self, payload):
         self.async_failed = True
         self.failed.append(payload)
 

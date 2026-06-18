@@ -15,18 +15,6 @@ impl Runtime {
         }
     }
 
-    pub fn begin_step(&self, req: BeginStepRequest) -> Result<StepOutcome> {
-        self.store.begin_step(req)
-    }
-
-    pub fn complete_step(&self, req: CompleteStepRequest) -> Result<()> {
-        self.store.complete_step(req)
-    }
-
-    pub fn fail_step(&self, req: FailStepRequest) -> Result<()> {
-        self.store.fail_step(req)
-    }
-
     pub fn register_run(&self, req: RegisterRunRequest) -> Result<()> {
         self.store.register_run(req)
     }
@@ -35,16 +23,20 @@ impl Runtime {
         self.store.register_dataset(req)
     }
 
-    pub fn complete_task(&self, req: CompleteTaskRequest) -> Result<()> {
-        self.store.complete_task(req)
+    pub fn begin(&self, req: BeginRequest) -> Result<Outcome> {
+        self.store.begin(req)
     }
 
-    pub fn fail_task(&self, req: FailTaskRequest) -> Result<()> {
-        self.store.fail_task(req)
+    pub fn complete(&self, req: CompleteRequest) -> Result<()> {
+        self.store.complete(req)
     }
 
-    pub fn list_tasks(&self, req: ListTasksRequest) -> Result<Vec<TaskRecord>> {
-        self.store.list_tasks(req)
+    pub fn fail(&self, req: FailRequest) -> Result<()> {
+        self.store.fail(req)
+    }
+
+    pub fn list(&self, req: ListRequest) -> Result<Vec<TaskRecord>> {
+        self.store.list(req)
     }
 
     pub fn register_variants(
@@ -58,8 +50,8 @@ impl Runtime {
         self.store.list_variants(run_id)
     }
 
-    pub fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
-        self.store.heartbeat_step(req)
+    pub fn heartbeat(&self, req: HeartbeatRequest) -> Result<bool> {
+        self.store.heartbeat(req)
     }
 
     pub fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord> {
@@ -69,10 +61,10 @@ impl Runtime {
     pub fn list_trace_events(
         &self,
         run_id: &str,
-        dataset_name: &str,
+        kind: &str,
         task_id: &str,
     ) -> Result<Vec<TraceEventRecord>> {
-        self.store.list_trace_events(run_id, dataset_name, task_id)
+        self.store.list_trace_events(run_id, kind, task_id)
     }
 
     pub fn memo_get(&self, req: MemoGetRequest) -> Result<MemoGetResponse> {

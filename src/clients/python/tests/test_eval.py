@@ -20,7 +20,7 @@ class Runtime:
         self.runs.append(payload)
 
     def register_dataset(self, payload):
-        key = (payload["run_id"], payload["dataset_name"])
+        key = (payload["run_id"], payload["kind"])
         records = self.tasks.setdefault(key, [])
         by_digest = {record["input_digest"]: record for record in records}
         for task in payload["tasks"]:
@@ -28,7 +28,7 @@ class Runtime:
                 continue
             record = {
                 "run_id": payload["run_id"],
-                "dataset_name": payload["dataset_name"],
+                "kind": payload["kind"],
                 "input_digest": task["input_digest"],
                 "label": task.get("label"),
                 "category": task.get("category"),
@@ -42,37 +42,64 @@ class Runtime:
             by_digest[task["input_digest"]] = record
         return {"total": len(records)}
 
-    def list_tasks(self, payload):
-        records = self.tasks[(payload["run_id"], payload["dataset_name"])]
+    def _record(self, payload):
+        for record in self.tasks[(payload["run_id"], payload["kind"])]:
+            if record["input_digest"] == payload["input_digest"]:
+                return record
+        return None
+
+    def begin(self, payload):
+        record = self._record(payload)
+        # New/unknown tasks (e.g. steps that were never registered) execute too.
+        if record is None or record["status"] in ("pending", "running", "failed"):
+            if record is not None:
+                record["status"] = "running"
+                record["attempt"] = record.get("attempt", 0) + 1
+            return {"type": "execute", "attempt": record["attempt"] if record else 1}
+        if record["status"] == "succeeded":
+            return {"type": "skip_completed", "output": record["output"]}
+        if record["status"] == "terminal":
+            return {"type": "failed_terminal", "error": record["error"]}
+        return {"type": "execute", "attempt": 1}
+
+    def list(self, payload):
+        records = self.tasks[(payload["run_id"], payload["kind"])]
         statuses = set(payload.get("statuses") or [])
         if statuses:
             return [record for record in records if record["status"] in statuses]
         return records
 
-    def complete_task(self, payload):
+    def complete(self, payload):
         self.completed.append(payload)
-        for record in self.tasks[(payload["run_id"], payload["dataset_name"])]:
-            if record["input_digest"] == payload["input_digest"]:
-                record["status"] = "succeeded"
-                record["output"] = payload["output"]
+        record = self._record(payload)
+        if record is not None:
+            record["status"] = "succeeded"
+            record["output"] = payload["output"]
 
-    def fail_task(self, payload):
+    def fail(self, payload):
         self.failed.append(payload)
+        record = self._record(payload)
+        if record is not None:
+            record["status"] = "failed"
+            record["error"] = payload["error"]
 
     async def aregister_dataset(self, payload):
         return self.register_dataset(payload)
 
-    async def alist_tasks(self, payload):
-        return self.list_tasks(payload)
+    async def abegin(self, payload):
+        return self.begin(payload)
+
+    async def alist(self, payload):
+        return self.list(payload)
 
     async def asummary(self, payload):
         return self.summary(payload)
 
-    async def acomplete_task(self, payload):
-        self.complete_task(payload)
+    async def acomplete(self, payload):
+        self.complete(payload)
 
-    async def afail_task(self, payload):
-        self.fail_task(payload)
+    async def afail(self, payload):
+        self.fail(payload)
 
     def memo_get(self, payload):
         key = (payload["run_id"], payload["key_digest"])
@@ -196,7 +223,8 @@ def test_dataset_records_callback_failures_and_continues():
     assert results == [None]
     assert runtime.failed[0]["error"]["failure_class"] == "eval_exception"
     assert runtime.failed[0]["input_digest"] == _json_digest({"id": "task"})
-    assert runtime.failed[0]["max_attempts"] == 5
+    # fail() no longer carries max_attempts; the retry policy is passed at begin().
+    assert "max_attempts" not in runtime.failed[0]
 
 
 def test_dataset_map_assigns_category_and_filters_by_categories():

@@ -2,6 +2,15 @@
 
 Python client for Durable Evals.
 
+Every unit of work — a dataset task or a durable step — is a single primitive: a
+"task" keyed by `(run_id, kind, input_digest)`, where `kind` is the dataset name
+or the step name. They share one begin/complete/fail path, so datasets get the
+same leasing, single-flight, and retry semantics as steps.
+
+The client auto-spawns the `durable-eval` server (`durable-eval serve`) on first
+use unless `DURABLE_EVALS_RUNTIME_URL` is already set (for example when launched
+by `durable-eval run`). Override the binary with `DURABLE_EVALS_SERVER_BIN`.
+
 ## Dataset Evals
 
 ```python

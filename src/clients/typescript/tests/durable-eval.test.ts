@@ -7,7 +7,7 @@ import {
   DurableStepFailed,
   DurableStepInProgress,
   type Runtime as DurableRuntime,
-  type StepOutcome,
+  type Outcome,
 } from "../dist/index.js";
 
 type Payload = Record<string, unknown>;
@@ -17,7 +17,7 @@ function digestOf(value: unknown): string {
 }
 
 class Runtime implements DurableRuntime {
-  outcome: StepOutcome;
+  outcome: Outcome | null;
   began: Payload[] = [];
   completed: Payload[] = [];
   failed: Payload[] = [];
@@ -28,30 +28,60 @@ class Runtime implements DurableRuntime {
   traceEvents: Payload[] = [];
   completeError: Error | null = null;
 
-  constructor(outcome: StepOutcome = { type: "execute", attempt: 1 }) {
+  // When an explicit outcome is provided (step tests), begin always returns it.
+  // Otherwise begin derives the outcome from the unified task store: an already
+  // succeeded task -> skip_completed, anything else -> execute.
+  constructor(outcome: Outcome | null = null) {
     this.outcome = outcome;
   }
 
-  async beginStep(payload: Payload): Promise<StepOutcome> {
-    this.began.push(payload);
-    return this.outcome;
+  private recordFor(payload: Payload): Payload | undefined {
+    const records = this.tasks.get(`${payload.run_id}:${payload.kind}`) ?? [];
+    return records.find((item) => item.input_digest === payload.input_digest);
   }
 
-  async completeStep(payload: Payload): Promise<void> {
+  async begin(payload: Payload): Promise<Outcome> {
+    this.began.push(payload);
+    if (this.outcome !== null) {
+      return this.outcome;
+    }
+    const record = this.recordFor(payload);
+    if (record && record.status === "succeeded") {
+      return { type: "skip_completed", output: record.output };
+    }
+    if (record && record.status === "terminal") {
+      return {
+        type: "failed_terminal",
+        error: { error_type: "Terminal", message: "terminal" },
+      };
+    }
+    return { type: "execute", attempt: 1 };
+  }
+
+  async complete(payload: Payload): Promise<void> {
     if (this.completeError !== null) {
       throw this.completeError;
     }
     this.completed.push(payload);
+    const record = this.recordFor(payload);
+    if (record) {
+      record.status = "succeeded";
+      record.output = payload.output;
+    }
   }
 
-  async failStep(payload: Payload): Promise<void> {
+  async fail(payload: Payload): Promise<void> {
     this.failed.push(payload);
+    const record = this.recordFor(payload);
+    if (record) {
+      record.status = "failed";
+    }
   }
 
   async registerRun(_payload: Payload): Promise<void> {}
 
   async registerDataset(payload: Payload): Promise<Payload> {
-    const key = `${payload.run_id}:${payload.dataset_name}`;
+    const key = `${payload.run_id}:${payload.kind}`;
     const existing = new Map(
       (this.tasks.get(key) ?? []).map((record) => [String(record.input_digest), record]),
     );
@@ -71,26 +101,12 @@ class Runtime implements DurableRuntime {
     return { total: records.length };
   }
 
-  async listTasks(payload: Payload): Promise<Payload[]> {
-    const records = this.tasks.get(`${payload.run_id}:${payload.dataset_name}`) ?? [];
+  async list(payload: Payload): Promise<Payload[]> {
+    const records = this.tasks.get(`${payload.run_id}:${payload.kind}`) ?? [];
     const statuses = new Set((payload.statuses as string[]) ?? []);
     return statuses.size === 0
       ? records
       : records.filter((record) => statuses.has(String(record.status)));
-  }
-
-  async completeTask(payload: Payload): Promise<void> {
-    this.completed.push(payload);
-    const records = this.tasks.get(`${payload.run_id}:${payload.dataset_name}`) ?? [];
-    const record = records.find((item) => item.input_digest === payload.input_digest);
-    if (record) {
-      record.status = "succeeded";
-      record.output = payload.output;
-    }
-  }
-
-  async failTask(payload: Payload): Promise<void> {
-    this.failed.push(payload);
   }
 
   async memoGet(payload: Payload): Promise<{ found: boolean; value: unknown }> {
@@ -141,7 +157,7 @@ test("returns a durable callback that completes a step", async () => {
     caseId: "case-1",
   });
   assert.equal(runtime.completed.length, 1);
-  assert.equal(runtime.completed[0].step_name, "runAgent");
+  assert.equal(runtime.completed[0].kind, "runAgent");
   assert.deepEqual(runtime.completed[0].output, {
     caseId: "case-1",
   });
@@ -246,7 +262,7 @@ test("supports user-owned orchestration", async () => {
 
   assert.deepEqual(results, [{ caseId: "case-1", answer: "ok" }]);
   assert.deepEqual(
-    runtime.completed.map((payload) => payload.step_name),
+    runtime.completed.map((payload) => payload.kind),
     ["fetchCases", "runAgent"],
   );
 });
@@ -404,7 +420,9 @@ test("dataset records callback failures and continues", async () => {
     (runtime.failed.at(-1)?.error as { failure_class?: string }).failure_class,
     "eval_exception",
   );
-  assert.equal(runtime.failed.at(-1)?.max_attempts, 5);
+  // fail no longer carries max_attempts; the retry policy is passed to begin.
+  assert.equal(runtime.failed.at(-1)?.max_attempts, undefined);
+  assert.deepEqual(runtime.began.at(-1)?.retry, { max_attempts: 5 });
 });
 
 test("memo caches values by key digest", async () => {

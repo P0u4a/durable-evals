@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::de::DeserializeOwned;
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::store::{Error, Result, Store};
@@ -13,10 +13,12 @@ use crate::types::*;
 
 /// Tasks are content-addressed: edits to an input create a new row under a new digest.
 /// Rows from earlier registrations are kept (so reverting an input reuses its old
-/// output) but only the latest registration's generation counts as the dataset.
+/// output) but only the latest registration's generation counts as the current dataset.
+/// Steps (a group of one) have no `datasets` row, so the COALESCE falls back to the
+/// task's own generation.
 const CURRENT_GENERATION: &str = "tasks.generation = COALESCE(
     (SELECT d.generation FROM datasets d
-     WHERE d.run_id = tasks.run_id AND d.dataset_name = tasks.dataset_name),
+     WHERE d.run_id = tasks.run_id AND d.kind = tasks.kind),
     tasks.generation)";
 
 #[derive(Clone)]
@@ -51,7 +53,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn begin_step(&self, req: BeginStepRequest) -> Result<StepOutcome> {
+    pub fn begin(&self, req: BeginRequest) -> Result<Outcome> {
         let config_json = serde_json::to_string(&req.config)?;
         let dependencies_json = serde_json::to_string(&req.dependencies)?;
         let variants_json = serde_json::to_string(&req.variants)?;
@@ -66,9 +68,9 @@ impl SqliteStore {
         let existing = tx
             .query_row(
                 "SELECT status, attempt, output_json, error_json, lease_expires_at, retry_at
-                 FROM step_states
-                 WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
-                params![req.run_id, req.step_name, req.input_digest],
+                 FROM tasks
+                 WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
+                params![req.run_id, req.kind, req.input_digest],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -84,15 +86,15 @@ impl SqliteStore {
 
         match existing {
             Some((status, _, output_json, _, _, _)) if status == "succeeded" => {
-                Ok(StepOutcome::SkipCompleted {
+                Ok(Outcome::SkipCompleted {
                     output: parse_optional(output_json)?.unwrap_or(Value::Null),
                 })
             }
             Some((status, _, _, error_json, _, _)) if status == "terminal" => {
-                Ok(StepOutcome::FailedTerminal {
+                Ok(Outcome::FailedTerminal {
                     error: parse_optional(error_json)?.unwrap_or(ErrorInfo {
-                        error_type: "StepFailed".to_string(),
-                        message: "step failed".to_string(),
+                        error_type: "TaskFailed".to_string(),
+                        message: "task failed".to_string(),
                         failure_class: FailureClass::DurableHarnessError,
                         stack: None,
                         retryable: Some(false),
@@ -102,36 +104,36 @@ impl SqliteStore {
             Some((status, _, _, _, lease_expires_at, _))
                 if status == "running" && lease_active(lease_expires_at.as_deref()) =>
             {
-                Ok(StepOutcome::InProgress)
+                Ok(Outcome::InProgress)
             }
             Some((_, attempt, _, _, _, _)) if attempt >= req.retry.max_attempts => {
                 tx.execute(
-                    "UPDATE step_states
+                    "UPDATE tasks
                      SET status = 'terminal', updated_at = datetime('now')
-                     WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
-                    params![req.run_id, req.step_name, req.input_digest],
+                     WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
+                    params![req.run_id, req.kind, req.input_digest],
                 )?;
                 tx.commit()?;
-                Ok(StepOutcome::FailedTerminal {
+                Ok(Outcome::FailedTerminal {
                     error: ErrorInfo {
                         error_type: "MaxAttemptsExceeded".to_string(),
-                        message: "step exceeded retry policy max_attempts".to_string(),
+                        message: "task exceeded retry policy max_attempts".to_string(),
                         failure_class: FailureClass::DurableHarnessError,
                         stack: None,
                         retryable: Some(false),
                     },
                 })
             }
-            // A failed step whose backoff window has not elapsed yet must wait.
+            // A failed task whose backoff window has not elapsed yet must wait.
             Some((status, _, _, _, _, Some(retry_at)))
                 if status == "failed" && retry_pending(&retry_at) =>
             {
-                Ok(StepOutcome::RetryLater { retry_at })
+                Ok(Outcome::RetryLater { retry_at })
             }
             Some((_, attempt, _, _, _, _)) => {
                 let next_attempt = attempt + 1;
                 tx.execute(
-                    "UPDATE step_states
+                    "UPDATE tasks
                      SET status = 'running',
                          attempt = ?4,
                          config_json = ?5,
@@ -145,10 +147,10 @@ impl SqliteStore {
                          retry_at = NULL,
                          started_at = COALESCE(started_at, datetime('now')),
                          updated_at = datetime('now')
-                     WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
+                     WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
                     params![
                         req.run_id,
-                        req.step_name,
+                        req.kind,
                         req.input_digest,
                         next_attempt,
                         config_json,
@@ -160,22 +162,26 @@ impl SqliteStore {
                     ],
                 )?;
                 tx.commit()?;
-                Ok(StepOutcome::Execute {
+                Ok(Outcome::Execute {
                     attempt: next_attempt,
                 })
             }
             None => {
+                // No pre-registered row (a step, or a task begun before register): upsert
+                // a fresh running row. `input_json` defaults to JSON null since begin does
+                // not carry the input; a pre-registered dataset task keeps its own input.
                 tx.execute(
-                    "INSERT INTO step_states
-                     (run_id, step_name, input_digest, status, attempt, config_json,
-                      dependencies_json, variants_json, retry_json, lease_owner,
-                      lease_acquired_at, lease_expires_at, heartbeat_at, started_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'running', 1, ?4, ?5, ?6, ?7, ?8,
+                    "INSERT INTO tasks
+                     (run_id, kind, input_digest, status, attempt, config_json,
+                      dependencies_json, variants_json, retry_json, input_json, lease_owner,
+                      lease_acquired_at, lease_expires_at, heartbeat_at, started_at,
+                      created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'running', 1, ?4, ?5, ?6, ?7, 'null', ?8,
                              datetime('now'), datetime('now', '+' || ?9 || ' seconds'),
-                             datetime('now'), datetime('now'), datetime('now'))",
+                             datetime('now'), datetime('now'), datetime('now'), datetime('now'))",
                     params![
                         req.run_id,
-                        req.step_name,
+                        req.kind,
                         req.input_digest,
                         config_json,
                         dependencies_json,
@@ -186,64 +192,44 @@ impl SqliteStore {
                     ],
                 )?;
                 tx.commit()?;
-                Ok(StepOutcome::Execute { attempt: 1 })
+                Ok(Outcome::Execute { attempt: 1 })
             }
         }
     }
 
-    pub fn complete_step(&self, req: CompleteStepRequest) -> Result<()> {
+    pub fn complete(&self, req: CompleteRequest) -> Result<()> {
         let output_json = serde_json::to_string(&req.output)?;
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let tx = conn.unchecked_transaction()?;
-        let updated = tx.execute(
-            "UPDATE step_states
+        let updated = conn.execute(
+            "UPDATE tasks
              SET status = 'succeeded', output_json = ?4, error_json = NULL,
                  lease_owner = NULL, lease_expires_at = NULL, completed_at = datetime('now'),
                  updated_at = datetime('now')
-             WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
-            params![req.run_id, req.step_name, req.input_digest, output_json],
+             WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
+            params![req.run_id, req.kind, req.input_digest, output_json],
         )?;
         if updated == 0 {
-            return Err(Error::StepNotFound);
+            return Err(Error::TaskNotFound);
         }
-        for artifact in req.artifacts {
-            tx.execute(
-                "INSERT OR REPLACE INTO artifacts
-                 (artifact_id, run_id, step_name, input_digest, name, kind, path,
-                  inline_json, sha256, size, valid, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))",
-                params![
-                    artifact.artifact_id,
-                    req.run_id,
-                    req.step_name,
-                    req.input_digest,
-                    artifact.name,
-                    artifact.kind,
-                    artifact.path,
-                    optional_json(artifact.inline_json)?,
-                    artifact.sha256,
-                    artifact.size,
-                    artifact.valid
-                ],
-            )?;
-        }
-        tx.commit()?;
         Ok(())
     }
 
-    pub fn fail_step(&self, req: FailStepRequest) -> Result<()> {
+    pub fn fail(&self, req: FailRequest) -> Result<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let (attempt, retry_json) = conn
             .query_row(
-                "SELECT attempt, retry_json FROM step_states
-                 WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
-                params![req.run_id, req.step_name, req.input_digest],
+                "SELECT attempt, retry_json FROM tasks
+                 WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
+                params![req.run_id, req.kind, req.input_digest],
                 |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
-            .ok_or(Error::StepNotFound)?;
+            .ok_or(Error::TaskNotFound)?;
         let retry_policy: RetryPolicy = serde_json::from_str(&retry_json).unwrap_or_default();
 
+        // Retryable failures stay `failed`; the attempt ceiling is enforced at the next
+        // `begin` (attempt >= max_attempts -> terminal), so failing never decides terminal
+        // on its own except for non-retryable classes.
         let retryable = req.error.retryable.unwrap_or_else(|| {
             retry_policy.retryable.contains(&req.error.failure_class)
                 && !retry_policy.terminal.contains(&req.error.failure_class)
@@ -258,15 +244,15 @@ impl SqliteStore {
             })
             .filter(|secs| *secs > 0);
         conn.execute(
-            "UPDATE step_states
+            "UPDATE tasks
              SET status = ?4, error_json = ?5, lease_owner = NULL, lease_expires_at = NULL,
                  retry_at = CASE WHEN ?6 IS NULL THEN NULL
                                  ELSE datetime('now', '+' || ?6 || ' seconds') END,
                  completed_at = datetime('now'), updated_at = datetime('now')
-             WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3",
+             WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
             params![
                 req.run_id,
-                req.step_name,
+                req.kind,
                 req.input_digest,
                 status,
                 error_json,
@@ -276,12 +262,12 @@ impl SqliteStore {
         let failure_class = failure_class_to_str(&req.error.failure_class);
         conn.execute(
             "INSERT INTO failure_records
-             (run_id, step_name, input_digest, attempt, failure_class, error_type,
+             (run_id, kind, input_digest, attempt, failure_class, error_type,
               message, stack, retryable, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))",
             params![
                 req.run_id,
-                req.step_name,
+                req.kind,
                 req.input_digest,
                 attempt,
                 failure_class,
@@ -298,14 +284,14 @@ impl SqliteStore {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO datasets (run_id, dataset_name, generation)
+            "INSERT INTO datasets (run_id, kind, generation)
              VALUES (?1, ?2, 1)
-             ON CONFLICT(run_id, dataset_name) DO UPDATE SET generation = generation + 1",
-            params![req.run_id, req.dataset_name],
+             ON CONFLICT(run_id, kind) DO UPDATE SET generation = generation + 1",
+            params![req.run_id, req.kind],
         )?;
         let generation: u32 = tx.query_row(
-            "SELECT generation FROM datasets WHERE run_id = ?1 AND dataset_name = ?2",
-            params![req.run_id, req.dataset_name],
+            "SELECT generation FROM datasets WHERE run_id = ?1 AND kind = ?2",
+            params![req.run_id, req.kind],
             |row| row.get(0),
         )?;
         // Identical inputs collapse to one content-addressed task; first occurrence wins.
@@ -316,10 +302,10 @@ impl SqliteStore {
             }
             tx.execute(
                 "INSERT INTO tasks
-                 (run_id, dataset_name, input_digest, label, category, position, generation,
+                 (run_id, kind, input_digest, label, category, position, generation,
                   input_json, status, attempt, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, datetime('now'), datetime('now'))
-                 ON CONFLICT(run_id, dataset_name, input_digest) DO UPDATE SET
+                 ON CONFLICT(run_id, kind, input_digest) DO UPDATE SET
                     label = excluded.label,
                     category = excluded.category,
                     position = excluded.position,
@@ -327,7 +313,7 @@ impl SqliteStore {
                     updated_at = datetime('now')",
                 params![
                     req.run_id,
-                    req.dataset_name,
+                    req.kind,
                     task.input_digest,
                     task.label,
                     task.category,
@@ -339,81 +325,16 @@ impl SqliteStore {
         }
         tx.commit()?;
         drop(conn); // release before dataset_summary re-locks the connection
-        self.dataset_summary(&req.run_id, &req.dataset_name)
+        self.dataset_summary(&req.run_id, &req.kind)
     }
 
-    pub fn complete_task(&self, req: CompleteTaskRequest) -> Result<()> {
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let updated = conn.execute(
-            "UPDATE tasks
-             SET status = 'succeeded', output_json = ?4, error_json = NULL,
-                 completed_at = datetime('now'), updated_at = datetime('now')
-             WHERE run_id = ?1 AND dataset_name = ?2 AND input_digest = ?3",
-            params![
-                req.run_id,
-                req.dataset_name,
-                req.input_digest,
-                serde_json::to_string(&req.output)?
-            ],
-        )?;
-        if updated == 0 {
-            return Err(Error::TaskNotFound);
-        }
-        Ok(())
-    }
-
-    pub fn fail_task(&self, req: FailTaskRequest) -> Result<()> {
-        let retryable = req.error.retryable.unwrap_or(matches!(
-            req.error.failure_class,
-            FailureClass::Transient
-                | FailureClass::ResourceUnavailable
-                | FailureClass::EvalException
-        ));
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let tx = conn.unchecked_transaction()?;
-        // Count this failed run as a consumed attempt and stop retrying once the
-        // ceiling is reached, mirroring the step retry policy.
-        let attempt: u32 = tx
-            .query_row(
-                "SELECT attempt FROM tasks
-                 WHERE run_id = ?1 AND dataset_name = ?2 AND input_digest = ?3",
-                params![req.run_id, req.dataset_name, req.input_digest],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or(Error::TaskNotFound)?;
-        let next_attempt = attempt + 1;
-        let exhausted = next_attempt >= req.max_attempts;
-        let status = if retryable && !exhausted {
-            "failed"
-        } else {
-            "terminal"
-        };
-        tx.execute(
-            "UPDATE tasks
-             SET status = ?4, attempt = ?5, error_json = ?6,
-                 completed_at = datetime('now'), updated_at = datetime('now')
-             WHERE run_id = ?1 AND dataset_name = ?2 AND input_digest = ?3",
-            params![
-                req.run_id,
-                req.dataset_name,
-                req.input_digest,
-                status,
-                next_attempt,
-                serde_json::to_string(&req.error)?
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn list_tasks(&self, req: ListTasksRequest) -> Result<Vec<TaskRecord>> {
+    pub fn list(&self, req: ListRequest) -> Result<Vec<TaskRecord>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let mut stmt = conn.prepare(&format!(
-            "SELECT run_id, dataset_name, input_digest, label, category, status, attempt,
+            "SELECT run_id, kind, input_digest, label, category, status, attempt,
                     input_json, output_json, error_json, started_at, completed_at
              FROM tasks
-             WHERE run_id = ?1 AND dataset_name = ?2
+             WHERE run_id = ?1 AND kind = ?2
                AND (?3 = '[]' OR status IN (SELECT value FROM json_each(?3)))
                AND (?4 = '[]' OR category IN (SELECT value FROM json_each(?4)))
                AND {CURRENT_GENERATION}
@@ -422,21 +343,21 @@ impl SqliteStore {
         let statuses = serde_json::to_string(&req.statuses)?;
         let categories = serde_json::to_string(&req.categories)?;
         let rows = stmt.query_map(
-            params![req.run_id, req.dataset_name, statuses, categories],
+            params![req.run_id, req.kind, statuses, categories],
             task_from_row,
         )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::Sqlite)
     }
 
-    pub fn dataset_summary(&self, run_id: &str, dataset_name: &str) -> Result<DatasetSummary> {
+    pub fn dataset_summary(&self, run_id: &str, kind: &str) -> Result<DatasetSummary> {
         let counts = self.counts(
             &format!(
                 "SELECT status, COUNT(*) FROM tasks
-                 WHERE run_id = ?1 AND dataset_name = ?2 AND {CURRENT_GENERATION}
+                 WHERE run_id = ?1 AND kind = ?2 AND {CURRENT_GENERATION}
                  GROUP BY status"
             ),
-            params![run_id, dataset_name],
+            params![run_id, kind],
         )?;
         Ok(DatasetSummary {
             total: counts.values().sum(),
@@ -491,16 +412,16 @@ impl SqliteStore {
             .map_err(Error::Sqlite)
     }
 
-    pub fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
+    pub fn heartbeat(&self, req: HeartbeatRequest) -> Result<bool> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let updated = conn.execute(
-            "UPDATE step_states
+            "UPDATE tasks
              SET heartbeat_at = datetime('now'), lease_expires_at = datetime('now', '+' || ?5 || ' seconds')
-             WHERE run_id = ?1 AND step_name = ?2 AND input_digest = ?3 AND lease_owner = ?4
+             WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3 AND lease_owner = ?4
                AND status = 'running'",
             params![
                 req.run_id,
-                req.step_name,
+                req.kind,
                 req.input_digest,
                 req.worker_id,
                 req.lease_seconds
@@ -516,18 +437,18 @@ impl SqliteStore {
         let event_index: u32 = conn.query_row(
             "SELECT COALESCE(MAX(event_index), 0) + 1
              FROM trace_events
-             WHERE run_id = ?1 AND dataset_name = ?2 AND task_id = ?3 AND attempt = ?4",
-            params![req.run_id, req.dataset_name, req.task_id, req.attempt],
+             WHERE run_id = ?1 AND kind = ?2 AND task_id = ?3 AND attempt = ?4",
+            params![req.run_id, req.kind, req.task_id, req.attempt],
             |row| row.get(0),
         )?;
         conn.execute(
             "INSERT INTO trace_events
-             (run_id, dataset_name, task_id, attempt, event_index, event_type,
+             (run_id, kind, task_id, attempt, event_index, event_type,
               payload_json, artifact_ids_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))",
             params![
                 req.run_id,
-                req.dataset_name,
+                req.kind,
                 req.task_id,
                 req.attempt,
                 event_index,
@@ -539,7 +460,7 @@ impl SqliteStore {
         Ok(TraceEventRecord {
             id: conn.last_insert_rowid(),
             run_id: req.run_id,
-            dataset_name: req.dataset_name,
+            kind: req.kind,
             task_id: req.task_id,
             attempt: req.attempt,
             event_index,
@@ -553,18 +474,18 @@ impl SqliteStore {
     pub fn list_trace_events(
         &self,
         run_id: &str,
-        dataset_name: &str,
+        kind: &str,
         task_id: &str,
     ) -> Result<Vec<TraceEventRecord>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, run_id, dataset_name, task_id, attempt, event_index, event_type,
+            "SELECT id, run_id, kind, task_id, attempt, event_index, event_type,
                     payload_json, artifact_ids_json, created_at
              FROM trace_events
-             WHERE run_id = ?1 AND dataset_name = ?2 AND task_id = ?3
+             WHERE run_id = ?1 AND kind = ?2 AND task_id = ?3
              ORDER BY attempt, event_index",
         )?;
-        let rows = stmt.query_map(params![run_id, dataset_name, task_id], trace_from_row)?;
+        let rows = stmt.query_map(params![run_id, kind, task_id], trace_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::Sqlite)
     }
@@ -632,20 +553,12 @@ impl SqliteStore {
             name,
             config: parse_required(config_json)?,
             config_digest,
-            step_counts: self.counts(
-                "SELECT status, COUNT(*) FROM step_states WHERE run_id = ?1 GROUP BY status",
-                params![req.run_id.clone()],
-            )?,
             task_counts: self.counts(
                 &format!(
                     "SELECT status, COUNT(*) FROM tasks
                      WHERE run_id = ?1 AND {CURRENT_GENERATION}
                      GROUP BY status"
                 ),
-                params![req.run_id.clone()],
-            )?,
-            artifact_count: self.scalar_count(
-                "SELECT COUNT(*) FROM artifacts WHERE run_id = ?1",
                 params![req.run_id.clone()],
             )?,
             failure_counts: self.counts(
@@ -668,10 +581,10 @@ impl SqliteStore {
             ExportKind::TaskResultsJsonl => {
                 let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT run_id, dataset_name, input_digest, label, category, status, attempt,
+                    "SELECT run_id, kind, input_digest, label, category, status, attempt,
                             input_json, output_json, error_json, started_at, completed_at
                      FROM tasks WHERE run_id = ?1 AND {CURRENT_GENERATION}
-                     ORDER BY dataset_name, position"
+                     ORDER BY kind, position"
                 ))?;
                 let rows = stmt.query_map(params![req.run_id], task_from_row)?;
                 let mut body = String::new();
@@ -684,77 +597,7 @@ impl SqliteStore {
                     body,
                 })
             }
-            ExportKind::FailureReportJson => Ok(ExportResponse {
-                content_type: "application/json".to_string(),
-                body: serde_json::to_string_pretty(&self.failure_records(&req.run_id)?)?,
-            }),
-            ExportKind::FailureReportCsv => {
-                let mut body =
-                    "run_id,step_name,input_digest,attempt,failure_class,error_type,message,timestamp\n"
-                        .to_string();
-                for failure in self.failure_records(&req.run_id)? {
-                    body.push_str(&csv_row([
-                        &failure.run_id,
-                        &failure.step_name,
-                        &failure.input_digest,
-                        &failure.attempt.to_string(),
-                        &format!("{:?}", failure.failure_class),
-                        &failure.error_type,
-                        &failure.message,
-                        &failure.timestamp,
-                    ]));
-                }
-                Ok(ExportResponse {
-                    content_type: "text/csv".to_string(),
-                    body,
-                })
-            }
-            ExportKind::AggregateMetricsJson => Ok(ExportResponse {
-                content_type: "application/json".to_string(),
-                body: serde_json::to_string_pretty(&json!({
-                    "summary": self.summary(SummaryRequest { run_id: req.run_id })?
-                }))?,
-            }),
-            ExportKind::AggregateMetricsCsv => {
-                let summary = self.summary(SummaryRequest { run_id: req.run_id })?;
-                let mut body = "metric,status,count\n".to_string();
-                for (status, count) in summary.step_counts {
-                    body.push_str(&format!("steps,{status},{count}\n"));
-                }
-                for (status, count) in summary.task_counts {
-                    body.push_str(&format!("tasks,{status},{count}\n"));
-                }
-                Ok(ExportResponse {
-                    content_type: "text/csv".to_string(),
-                    body,
-                })
-            }
         }
-    }
-
-    fn failure_records(&self, run_id: &str) -> Result<Vec<FailureRecord>> {
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT run_id, step_name, input_digest, attempt, failure_class, error_type,
-                    message, stack, retryable, timestamp
-             FROM failure_records WHERE run_id = ?1 ORDER BY timestamp",
-        )?;
-        let rows = stmt.query_map(params![run_id], |row| {
-            Ok(FailureRecord {
-                run_id: row.get(0)?,
-                step_name: row.get(1)?,
-                input_digest: row.get(2)?,
-                attempt: row.get(3)?,
-                failure_class: parse_failure_class(row.get::<_, String>(4)?),
-                error_type: row.get(5)?,
-                message: row.get(6)?,
-                stack: row.get(7)?,
-                retryable: row.get(8)?,
-                timestamp: row.get(9)?,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::Sqlite)
     }
 
     fn counts<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<BTreeMap<String, u32>> {
@@ -771,11 +614,6 @@ impl SqliteStore {
         Ok(counts)
     }
 
-    fn scalar_count<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<u32> {
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        Ok(conn.query_row(sql, params, |row| row.get(0))?)
-    }
-
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         conn.execute_batch(
@@ -787,9 +625,15 @@ impl SqliteStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS step_states (
+            CREATE TABLE IF NOT EXISTS datasets (
                 run_id TEXT NOT NULL,
-                step_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                PRIMARY KEY (run_id, kind)
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                run_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
                 input_digest TEXT NOT NULL,
                 status TEXT NOT NULL,
                 attempt INTEGER NOT NULL,
@@ -797,6 +641,11 @@ impl SqliteStore {
                 dependencies_json TEXT NOT NULL DEFAULT '[]',
                 variants_json TEXT NOT NULL DEFAULT '{}',
                 retry_json TEXT NOT NULL DEFAULT '{}',
+                label TEXT,
+                category TEXT,
+                position INTEGER,
+                generation INTEGER NOT NULL DEFAULT 1,
+                input_json TEXT NOT NULL DEFAULT 'null',
                 output_json TEXT,
                 error_json TEXT,
                 lease_owner TEXT,
@@ -806,13 +655,14 @@ impl SqliteStore {
                 retry_at TEXT,
                 started_at TEXT,
                 completed_at TEXT,
+                created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY (run_id, step_name, input_digest)
+                PRIMARY KEY (run_id, kind, input_digest)
             );
             CREATE TABLE IF NOT EXISTS failure_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
-                step_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
                 input_digest TEXT NOT NULL,
                 attempt INTEGER NOT NULL,
                 failure_class TEXT NOT NULL,
@@ -821,45 +671,6 @@ impl SqliteStore {
                 stack TEXT,
                 retryable INTEGER NOT NULL,
                 timestamp TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS artifacts (
-                artifact_id TEXT PRIMARY KEY,
-                run_id TEXT NOT NULL,
-                step_name TEXT NOT NULL,
-                input_digest TEXT NOT NULL,
-                name TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                path TEXT,
-                inline_json TEXT,
-                sha256 TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                valid INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS datasets (
-                run_id TEXT NOT NULL,
-                dataset_name TEXT NOT NULL,
-                generation INTEGER NOT NULL,
-                PRIMARY KEY (run_id, dataset_name)
-            );
-            CREATE TABLE IF NOT EXISTS tasks (
-                run_id TEXT NOT NULL,
-                dataset_name TEXT NOT NULL,
-                input_digest TEXT NOT NULL,
-                label TEXT,
-                category TEXT,
-                position INTEGER NOT NULL,
-                generation INTEGER NOT NULL DEFAULT 1,
-                input_json TEXT NOT NULL,
-                status TEXT NOT NULL,
-                attempt INTEGER NOT NULL,
-                output_json TEXT,
-                error_json TEXT,
-                started_at TEXT,
-                completed_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (run_id, dataset_name, input_digest)
             );
             CREATE TABLE IF NOT EXISTS memos (
                 run_id TEXT NOT NULL,
@@ -880,7 +691,7 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS trace_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
-                dataset_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
                 task_id TEXT NOT NULL,
                 attempt INTEGER NOT NULL,
                 event_index INTEGER NOT NULL,
@@ -890,11 +701,10 @@ impl SqliteStore {
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_failure_records_run ON failure_records (run_id);
-            CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts (run_id);
             CREATE INDEX IF NOT EXISTS idx_trace_events_task
-                ON trace_events (run_id, dataset_name, task_id, attempt, event_index);
+                ON trace_events (run_id, kind, task_id, attempt, event_index);
             CREATE UNIQUE INDEX IF NOT EXISTS uq_trace_events_index
-                ON trace_events (run_id, dataset_name, task_id, attempt, event_index);",
+                ON trace_events (run_id, kind, task_id, attempt, event_index);",
         )?;
         Ok(())
     }
@@ -904,26 +714,20 @@ impl Store for SqliteStore {
     fn register_run(&self, req: RegisterRunRequest) -> Result<()> {
         self.register_run(req)
     }
-    fn begin_step(&self, req: BeginStepRequest) -> Result<StepOutcome> {
-        self.begin_step(req)
-    }
-    fn complete_step(&self, req: CompleteStepRequest) -> Result<()> {
-        self.complete_step(req)
-    }
-    fn fail_step(&self, req: FailStepRequest) -> Result<()> {
-        self.fail_step(req)
-    }
     fn register_dataset(&self, req: RegisterDatasetRequest) -> Result<DatasetSummary> {
         self.register_dataset(req)
     }
-    fn complete_task(&self, req: CompleteTaskRequest) -> Result<()> {
-        self.complete_task(req)
+    fn begin(&self, req: BeginRequest) -> Result<Outcome> {
+        self.begin(req)
     }
-    fn fail_task(&self, req: FailTaskRequest) -> Result<()> {
-        self.fail_task(req)
+    fn complete(&self, req: CompleteRequest) -> Result<()> {
+        self.complete(req)
     }
-    fn list_tasks(&self, req: ListTasksRequest) -> Result<Vec<TaskRecord>> {
-        self.list_tasks(req)
+    fn fail(&self, req: FailRequest) -> Result<()> {
+        self.fail(req)
+    }
+    fn list(&self, req: ListRequest) -> Result<Vec<TaskRecord>> {
+        self.list(req)
     }
     fn register_variants(&self, req: RegisterVariantsRequest) -> Result<Vec<VariantRecord>> {
         self.register_variants(req)
@@ -931,8 +735,8 @@ impl Store for SqliteStore {
     fn list_variants(&self, run_id: &str) -> Result<Vec<VariantRecord>> {
         self.list_variants(run_id)
     }
-    fn heartbeat_step(&self, req: HeartbeatStepRequest) -> Result<bool> {
-        self.heartbeat_step(req)
+    fn heartbeat(&self, req: HeartbeatRequest) -> Result<bool> {
+        self.heartbeat(req)
     }
     fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord> {
         self.add_trace_event(req)
@@ -940,10 +744,10 @@ impl Store for SqliteStore {
     fn list_trace_events(
         &self,
         run_id: &str,
-        dataset_name: &str,
+        kind: &str,
         task_id: &str,
     ) -> Result<Vec<TraceEventRecord>> {
-        self.list_trace_events(run_id, dataset_name, task_id)
+        self.list_trace_events(run_id, kind, task_id)
     }
     fn memo_get(&self, req: MemoGetRequest) -> Result<MemoGetResponse> {
         self.memo_get(req)
@@ -962,7 +766,7 @@ impl Store for SqliteStore {
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     Ok(TaskRecord {
         run_id: row.get(0)?,
-        dataset_name: row.get(1)?,
+        kind: row.get(1)?,
         input_digest: row.get(2)?,
         label: row.get(3)?,
         category: row.get(4)?,
@@ -980,7 +784,7 @@ fn trace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TraceEventRecord>
     Ok(TraceEventRecord {
         id: row.get(0)?,
         run_id: row.get(1)?,
-        dataset_name: row.get(2)?,
+        kind: row.get(2)?,
         task_id: row.get(3)?,
         attempt: row.get(4)?,
         event_index: row.get(5)?,
@@ -999,13 +803,6 @@ fn parse_required<T: DeserializeOwned>(json: String) -> rusqlite::Result<T> {
 
 fn parse_optional<T: DeserializeOwned>(json: Option<String>) -> rusqlite::Result<Option<T>> {
     json.map(parse_required).transpose()
-}
-
-fn optional_json(value: Option<Value>) -> Result<Option<String>> {
-    value
-        .map(|value| serde_json::to_string(&value))
-        .transpose()
-        .map_err(Error::Json)
 }
 
 fn digest_json(value: &Value) -> Result<String> {
@@ -1045,27 +842,6 @@ fn jitter_seed() -> u64 {
     Utc::now().timestamp_subsec_nanos() as u64
 }
 
-fn csv_row<const N: usize>(fields: [&str; N]) -> String {
-    let mut line = String::with_capacity(64);
-    for (index, field) in fields.iter().enumerate() {
-        if index > 0 {
-            line.push(',');
-        }
-        line.push_str(&csv_field(field));
-    }
-    line.push('\n');
-    line
-}
-
-/// Quote a CSV field per RFC 4180 when it contains a comma, quote, or newline.
-fn csv_field(value: &str) -> String {
-    if value.contains(|c| matches!(c, ',' | '"' | '\n' | '\r')) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
-}
-
 fn failure_class_to_str(class: &FailureClass) -> &'static str {
     match class {
         FailureClass::Transient => "transient",
@@ -1073,16 +849,6 @@ fn failure_class_to_str(class: &FailureClass) -> &'static str {
         FailureClass::EvalException => "eval_exception",
         FailureClass::DurableHarnessError => "durable_harness_error",
         FailureClass::ArtifactError => "artifact_error",
-    }
-}
-
-fn parse_failure_class(value: String) -> FailureClass {
-    match value.as_str() {
-        "transient" => FailureClass::Transient,
-        "resource_unavailable" => FailureClass::ResourceUnavailable,
-        "durable_harness_error" => FailureClass::DurableHarnessError,
-        "artifact_error" => FailureClass::ArtifactError,
-        _ => FailureClass::EvalException,
     }
 }
 
@@ -1095,10 +861,10 @@ mod tests {
         SqliteStore::open(":memory:").expect("open sqlite store")
     }
 
-    fn begin_req() -> BeginStepRequest {
-        BeginStepRequest {
+    fn begin_req() -> BeginRequest {
+        BeginRequest {
             run_id: "run".to_string(),
-            step_name: "step".to_string(),
+            kind: "step".to_string(),
             input_digest: "digest".to_string(),
             config: Value::Null,
             dependencies: vec![],
@@ -1109,64 +875,67 @@ mod tests {
         }
     }
 
+    fn transient_error() -> ErrorInfo {
+        ErrorInfo {
+            error_type: "RuntimeError".to_string(),
+            message: "temporary failure".to_string(),
+            failure_class: FailureClass::Transient,
+            stack: None,
+            retryable: Some(true),
+        }
+    }
+
     #[test]
-    fn running_step_reports_in_progress() {
+    fn running_task_reports_in_progress() {
         let store = store();
         assert!(matches!(
-            store.begin_step(begin_req()).expect("begin first step"),
-            StepOutcome::Execute { attempt: 1 }
+            store.begin(begin_req()).expect("begin first"),
+            Outcome::Execute { attempt: 1 }
         ));
         assert!(matches!(
-            store.begin_step(begin_req()).expect("begin running step"),
-            StepOutcome::InProgress
+            store.begin(begin_req()).expect("begin running"),
+            Outcome::InProgress
         ));
     }
 
     #[test]
-    fn failed_step_retries_on_next_begin() {
+    fn failed_task_retries_on_next_begin() {
         let store = store();
-        store.begin_step(begin_req()).expect("begin step");
+        store.begin(begin_req()).expect("begin");
         store
-            .fail_step(FailStepRequest {
+            .fail(FailRequest {
                 run_id: "run".to_string(),
-                step_name: "step".to_string(),
+                kind: "step".to_string(),
                 input_digest: "digest".to_string(),
-                error: ErrorInfo {
-                    error_type: "RuntimeError".to_string(),
-                    message: "temporary failure".to_string(),
-                    failure_class: FailureClass::Transient,
-                    stack: None,
-                    retryable: Some(true),
-                },
+                error: transient_error(),
             })
-            .expect("mark step failed");
+            .expect("mark failed");
         assert!(matches!(
-            store.begin_step(begin_req()).expect("retry failed step"),
-            StepOutcome::Execute { attempt: 2 }
+            store.begin(begin_req()).expect("retry failed"),
+            Outcome::Execute { attempt: 2 }
         ));
     }
 
     #[test]
-    fn completed_step_skips_with_output() {
+    fn completed_task_skips_with_output() {
         let store = store();
-        store.begin_step(begin_req()).expect("begin step");
+        store.begin(begin_req()).expect("begin");
         store
-            .complete_step(CompleteStepRequest {
+            .complete(CompleteRequest {
                 run_id: "run".to_string(),
-                step_name: "step".to_string(),
+                kind: "step".to_string(),
                 input_digest: "digest".to_string(),
                 output: json!({"ok": true}),
-                artifacts: vec![],
             })
-            .expect("complete step");
+            .expect("complete");
         assert!(matches!(
-            store.begin_step(begin_req()).expect("begin completed step"),
-            StepOutcome::SkipCompleted { output } if output == json!({"ok": true})
+            store.begin(begin_req()).expect("begin completed"),
+            Outcome::SkipCompleted { output } if output == json!({"ok": true})
         ));
     }
 
-    fn task(digest: &str, input: Value) -> DatasetTaskInput {
-        DatasetTaskInput {
+    fn task(digest: &str, input: Value) -> TaskInput {
+        TaskInput {
             input_digest: digest.to_string(),
             input,
             label: None,
@@ -1174,8 +943,8 @@ mod tests {
         }
     }
 
-    fn categorized(digest: &str, input: Value, category: &str) -> DatasetTaskInput {
-        DatasetTaskInput {
+    fn categorized(digest: &str, input: Value, category: &str) -> TaskInput {
+        TaskInput {
             input_digest: digest.to_string(),
             input,
             label: None,
@@ -1183,11 +952,11 @@ mod tests {
         }
     }
 
-    fn register(store: &SqliteStore, tasks: Vec<DatasetTaskInput>) -> DatasetSummary {
+    fn register(store: &SqliteStore, tasks: Vec<TaskInput>) -> DatasetSummary {
         store
             .register_dataset(RegisterDatasetRequest {
                 run_id: "run".to_string(),
-                dataset_name: "dataset".to_string(),
+                kind: "dataset".to_string(),
                 tasks,
             })
             .expect("register dataset")
@@ -1195,9 +964,9 @@ mod tests {
 
     fn list(store: &SqliteStore, statuses: Vec<String>, categories: Vec<String>) -> Vec<TaskRecord> {
         store
-            .list_tasks(ListTasksRequest {
+            .list(ListRequest {
                 run_id: "run".to_string(),
-                dataset_name: "dataset".to_string(),
+                kind: "dataset".to_string(),
                 statuses,
                 categories,
             })
@@ -1220,9 +989,9 @@ mod tests {
         let store = store();
         register(&store, vec![task("a", json!({"x": 1}))]);
         store
-            .complete_task(CompleteTaskRequest {
+            .complete(CompleteRequest {
                 run_id: "run".to_string(),
-                dataset_name: "dataset".to_string(),
+                kind: "dataset".to_string(),
                 input_digest: "a".to_string(),
                 output: json!({"ok": true}),
             })
@@ -1244,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn list_tasks_filters_by_category() {
+    fn list_filters_by_category() {
         let store = store();
         register(
             &store,
@@ -1257,44 +1026,54 @@ mod tests {
         let math = list(&store, vec![], vec!["math".to_string()]);
         assert_eq!(math.len(), 2);
         assert!(math.iter().all(|t| t.category.as_deref() == Some("math")));
-        let all = list(&store, vec![], vec![]);
-        assert_eq!(all.len(), 3);
-    }
-
-    fn fail_task_req(max_attempts: u32) -> FailTaskRequest {
-        FailTaskRequest {
-            run_id: "run".to_string(),
-            dataset_name: "dataset".to_string(),
-            input_digest: "a".to_string(),
-            error: ErrorInfo {
-                error_type: "RuntimeError".to_string(),
-                message: "boom".to_string(),
-                failure_class: FailureClass::Transient,
-                stack: None,
-                retryable: Some(true),
-            },
-            max_attempts,
-        }
+        assert_eq!(list(&store, vec![], vec![]).len(), 3);
     }
 
     #[test]
-    fn task_goes_terminal_after_max_attempts() {
+    fn dataset_task_goes_terminal_after_max_attempts() {
         let store = store();
         register(&store, vec![task("a", json!({"x": 1}))]);
+        let begin = || {
+            store
+                .begin(BeginRequest {
+                    run_id: "run".to_string(),
+                    kind: "dataset".to_string(),
+                    input_digest: "a".to_string(),
+                    config: Value::Null,
+                    dependencies: vec![],
+                    variants: BTreeMap::new(),
+                    retry: RetryPolicy {
+                        max_attempts: 2,
+                        ..RetryPolicy::default()
+                    },
+                    worker_id: None,
+                    lease_seconds: None,
+                })
+                .expect("begin")
+        };
+        let fail = || {
+            store
+                .fail(FailRequest {
+                    run_id: "run".to_string(),
+                    kind: "dataset".to_string(),
+                    input_digest: "a".to_string(),
+                    error: transient_error(),
+                })
+                .expect("fail")
+        };
 
-        store.fail_task(fail_task_req(2)).expect("first failure");
-        let failed = list(&store, vec!["failed".to_string()], vec![]);
-        assert_eq!(failed.len(), 1, "first failure stays retryable");
-        assert_eq!(failed[0].attempt, 1);
-
-        store.fail_task(fail_task_req(2)).expect("second failure");
+        assert!(matches!(begin(), Outcome::Execute { attempt: 1 }));
+        fail();
+        assert!(matches!(begin(), Outcome::Execute { attempt: 2 }));
+        fail();
+        // Attempt ceiling reached: the next begin marks the task terminal.
+        assert!(matches!(begin(), Outcome::FailedTerminal { .. }));
         let terminal = list(&store, vec!["terminal".to_string()], vec![]);
-        assert_eq!(terminal.len(), 1, "ceiling reached marks terminal");
-        assert_eq!(terminal[0].attempt, 2);
+        assert_eq!(terminal.len(), 1);
     }
 
     #[test]
-    fn failed_step_with_backoff_reports_retry_later() {
+    fn failed_task_with_backoff_reports_retry_later() {
         let store = store();
         let mut req = begin_req();
         req.retry = RetryPolicy {
@@ -1303,27 +1082,21 @@ mod tests {
             ..RetryPolicy::default()
         };
         assert!(matches!(
-            store.begin_step(req.clone()).expect("begin step"),
-            StepOutcome::Execute { attempt: 1 }
+            store.begin(req.clone()).expect("begin"),
+            Outcome::Execute { attempt: 1 }
         ));
         store
-            .fail_step(FailStepRequest {
+            .fail(FailRequest {
                 run_id: "run".to_string(),
-                step_name: "step".to_string(),
+                kind: "step".to_string(),
                 input_digest: "digest".to_string(),
-                error: ErrorInfo {
-                    error_type: "RuntimeError".to_string(),
-                    message: "temporary failure".to_string(),
-                    failure_class: FailureClass::Transient,
-                    stack: None,
-                    retryable: Some(true),
-                },
+                error: transient_error(),
             })
-            .expect("mark step failed");
+            .expect("mark failed");
         assert!(
             matches!(
-                store.begin_step(req).expect("begin during backoff"),
-                StepOutcome::RetryLater { .. }
+                store.begin(req).expect("begin during backoff"),
+                Outcome::RetryLater { .. }
             ),
             "backoff window should defer the retry"
         );

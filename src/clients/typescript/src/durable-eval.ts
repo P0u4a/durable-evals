@@ -140,9 +140,9 @@ export class DurableEval {
   ): Promise<Awaited<TOutput>> {
     const runtime = await this.getRuntime();
     const inputDigest = inputDigestFor(stepName, args);
-    const outcome = await runtime.beginStep({
+    const outcome = await runtime.begin({
       run_id: this.runId,
-      step_name: stepName,
+      kind: stepName,
       input_digest: inputDigest,
       retry: options.retry ?? {},
     });
@@ -168,9 +168,9 @@ export class DurableEval {
     try {
       result = await callback(...args);
     } catch (error) {
-      await runtime.failStep({
+      await runtime.fail({
         run_id: this.runId,
-        step_name: stepName,
+        kind: stepName,
         input_digest: inputDigest,
         error: {
           error_type: error instanceof Error ? error.name : "Error",
@@ -183,9 +183,9 @@ export class DurableEval {
     }
 
     assertJsonSerializable(result, `step output for ${stepName}`);
-    await runtime.completeStep({
+    await runtime.complete({
       run_id: this.runId,
-      step_name: stepName,
+      kind: stepName,
       input_digest: inputDigest,
       output: result,
     });
@@ -228,8 +228,9 @@ export class Dataset<TTask> {
   }): Promise<TOutput[]> {
     const runtime = await this.runtime();
     const categoryOf = options.category ?? this.category;
-    const records = await this.register(options.id, categoryOf);
-    const byDigest = new Map(records.map((record) => [String(record.input_digest), record]));
+    // Register the dataset first so its tasks exist as the canonical primitive,
+    // then drive each unique digest through the unified begin/complete/fail path.
+    await this.register(options.id, categoryOf);
     const categoryFilter =
       options.categories && options.categories.length > 0
         ? new Set(options.categories)
@@ -247,19 +248,6 @@ export class Dataset<TTask> {
     const outputs = new Array<TOutput>(this.tasks.length);
     const runnable: Array<{ digest: string; positions: number[] }> = [];
     for (const [digest, positions] of positionsByDigest) {
-      const record = byDigest.get(digest);
-      if (!record) {
-        throw new Error(`missing registered task: ${digest}`);
-      }
-      if (record.status === "succeeded") {
-        for (const position of positions) {
-          outputs[position] = record.output as TOutput;
-        }
-        continue;
-      }
-      if (record.status === "terminal") {
-        continue;
-      }
       if (categoryFilter) {
         const task = this.tasks[positions[0]];
         const taskCategory = categoryOf ? categoryOf(task) : undefined;
@@ -272,17 +260,37 @@ export class Dataset<TTask> {
     let cursor = 0;
     const concurrency = options.concurrency ?? 1;
     const maxAttempts = options.maxAttempts ?? 3;
+    const retry = { max_attempts: maxAttempts };
 
     const worker = async (): Promise<void> => {
       while (cursor < runnable.length) {
         const { digest, positions } = runnable[cursor++];
         const task = this.tasks[positions[0]];
+        const outcome = await runtime.begin({
+          run_id: this.evalRun.runId,
+          kind: this.datasetName,
+          input_digest: digest,
+          retry,
+        });
+
+        if (outcome.type === "skip_completed") {
+          for (const position of positions) {
+            outputs[position] = outcome.output as TOutput;
+          }
+          options.progress?.(await this.summary());
+          continue;
+        }
+        // in_progress / retry_later / failed_terminal: leave positions empty.
+        if (outcome.type !== "execute") {
+          continue;
+        }
+
         try {
           const output = await options.run(task);
           assertJsonSerializable(output, `dataset output for ${this.datasetName}`);
-          await runtime.completeTask!({
+          await runtime.complete({
             run_id: this.evalRun.runId,
-            dataset_name: this.datasetName,
+            kind: this.datasetName,
             input_digest: digest,
             output,
           });
@@ -292,13 +300,12 @@ export class Dataset<TTask> {
           options.progress?.(await this.summary());
         } catch (error) {
           // Record the failure durably and keep going; aborting here would cancel
-          // sibling tasks that are still running.
-          await runtime.failTask!({
+          // sibling tasks that are still running. Positions are left empty.
+          await runtime.fail({
             run_id: this.evalRun.runId,
-            dataset_name: this.datasetName,
+            kind: this.datasetName,
             input_digest: digest,
             error: errorPayload(error),
-            max_attempts: maxAttempts,
           });
         }
       }
@@ -312,9 +319,9 @@ export class Dataset<TTask> {
 
   async summary(): Promise<Record<string, number>> {
     const records = await this.runtime().then((runtime) =>
-      runtime.listTasks!({
+      runtime.list!({
         run_id: this.evalRun.runId,
-        dataset_name: this.datasetName,
+        kind: this.datasetName,
         statuses: [],
       }),
     );
@@ -352,7 +359,7 @@ export class Dataset<TTask> {
     const runtime = await this.runtime();
     await runtime.registerDataset!({
       run_id: this.evalRun.runId,
-      dataset_name: this.datasetName,
+      kind: this.datasetName,
       tasks: this.tasks.map((task) => ({
         input_digest: digestJson(task),
         input: task,
@@ -360,18 +367,18 @@ export class Dataset<TTask> {
         category: category ? category(task) : null,
       })),
     });
-    return await runtime.listTasks!({
+    return await runtime.list!({
       run_id: this.evalRun.runId,
-      dataset_name: this.datasetName,
+      kind: this.datasetName,
       statuses: [],
     });
   }
 
   private async tasksByStatus(statuses: string[]): Promise<Array<Record<string, unknown>>> {
     const runtime = await this.runtime();
-    return await runtime.listTasks!({
+    return await runtime.list!({
       run_id: this.evalRun.runId,
-      dataset_name: this.datasetName,
+      kind: this.datasetName,
       statuses,
     });
   }
@@ -379,9 +386,7 @@ export class Dataset<TTask> {
   private async runtime(): Promise<Runtime> {
     const runtime = await (this.evalRun as unknown as { getRuntime(): Promise<Runtime> }).getRuntime();
     assertRuntimeMethod(runtime.registerDataset, "registerDataset");
-    assertRuntimeMethod(runtime.listTasks, "listTasks");
-    assertRuntimeMethod(runtime.completeTask, "completeTask");
-    assertRuntimeMethod(runtime.failTask, "failTask");
+    assertRuntimeMethod(runtime.list, "list");
     return runtime;
   }
 }
@@ -403,7 +408,7 @@ export class TraceTask {
     assertRuntimeMethod(runtime.traceEvent, "traceEvent");
     return await runtime.traceEvent({
       run_id: this.evalRun.runId,
-      dataset_name: this.datasetName,
+      kind: this.datasetName,
       task_id: this.taskId,
       attempt: this.attempt,
       event_type: eventType,

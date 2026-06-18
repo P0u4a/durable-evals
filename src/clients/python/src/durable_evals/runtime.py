@@ -54,11 +54,11 @@ class RuntimeClient:
 
     @classmethod
     def _spawn(cls, storage_dir: Path, metadata_path: Path) -> "RuntimeClient":
-        server_bin = os.environ.get("DURABLE_EVALS_SERVER_BIN", "durable-evals-server")
+        server_bin = os.environ.get("DURABLE_EVALS_SERVER_BIN", "durable-eval")
         db_path = storage_dir / "evals.sqlite"
         env = {**os.environ, "DURABLE_EVALS_DB": str(db_path)}
         process = subprocess.Popen(
-            [server_bin],
+            [server_bin, "serve"],
             env=env,
             stdout=subprocess.PIPE,
             stderr=(storage_dir / "server.log").open("ab"),
@@ -93,17 +93,22 @@ class RuntimeClient:
             time.sleep(0.05)
         raise RuntimeError("durable evals server did not become healthy")
 
-    def begin_step(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._post("/steps/begin", payload)
+    # Unified task primitive: every unit of work is a task keyed by
+    # (run_id, kind, input_digest), where kind is a step name or a dataset name.
+    def begin(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/tasks/begin", payload)
 
-    def complete_step(self, payload: dict[str, Any]) -> None:
-        self._post("/steps/complete", payload)
+    def complete(self, payload: dict[str, Any]) -> None:
+        self._post("/tasks/complete", payload)
 
-    def fail_step(self, payload: dict[str, Any]) -> None:
-        self._post("/steps/fail", payload)
+    def fail(self, payload: dict[str, Any]) -> None:
+        self._post("/tasks/fail", payload)
 
-    def heartbeat_step(self, payload: dict[str, Any]) -> None:
-        self._post("/steps/heartbeat", payload)
+    def list(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._post("/tasks/list", payload)
+
+    def heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/tasks/heartbeat", payload)
 
     def register_run(self, payload: dict[str, Any]) -> None:
         self._post("/runs/register", payload)
@@ -117,15 +122,6 @@ class RuntimeClient:
     def register_dataset(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/datasets/register", payload)
 
-    def list_tasks(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        return self._post("/datasets/tasks/list", payload)
-
-    def complete_task(self, payload: dict[str, Any]) -> None:
-        self._post("/datasets/tasks/complete", payload)
-
-    def fail_task(self, payload: dict[str, Any]) -> None:
-        self._post("/datasets/tasks/fail", payload)
-
     def register_variants(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         return self._post("/variants/register", payload)
 
@@ -138,29 +134,23 @@ class RuntimeClient:
     def memo_put(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/memos/put", payload)
 
-    async def abegin_step(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._apost("/steps/begin", payload)
+    async def abegin(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._apost("/tasks/begin", payload)
 
-    async def acomplete_step(self, payload: dict[str, Any]) -> None:
-        await self._apost("/steps/complete", payload)
+    async def acomplete(self, payload: dict[str, Any]) -> None:
+        await self._apost("/tasks/complete", payload)
 
-    async def afail_step(self, payload: dict[str, Any]) -> None:
-        await self._apost("/steps/fail", payload)
+    async def afail(self, payload: dict[str, Any]) -> None:
+        await self._apost("/tasks/fail", payload)
+
+    async def alist(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return await self._apost("/tasks/list", payload)
 
     async def aregister_dataset(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._apost("/datasets/register", payload)
 
-    async def alist_tasks(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        return await self._apost("/datasets/tasks/list", payload)
-
     async def asummary(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._apost("/runs/summary", payload)
-
-    async def acomplete_task(self, payload: dict[str, Any]) -> None:
-        await self._apost("/datasets/tasks/complete", payload)
-
-    async def afail_task(self, payload: dict[str, Any]) -> None:
-        await self._apost("/datasets/tasks/fail", payload)
 
     async def amemo_get(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._apost("/memos/get", payload)

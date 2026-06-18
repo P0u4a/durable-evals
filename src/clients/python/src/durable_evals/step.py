@@ -23,37 +23,37 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
         return lambda wrapped: step(wrapped, name=name, retry=retry)  # type: ignore[return-value]
 
     def begin(self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> BeginResult:
-        step_name = name or f"{fn.__module__}.{fn.__qualname__}"
-        input_digest = input_digest_for(step_name, args, kwargs)
+        kind = name or f"{fn.__module__}.{fn.__qualname__}"
+        input_digest = input_digest_for(kind, args, kwargs)
 
-        outcome = self._runtime.begin_step(
+        outcome = self._runtime.begin(
             {
                 "run_id": self.run_id,
-                "step_name": step_name,
+                "kind": kind,
                 "input_digest": input_digest,
                 "retry": retry or {},
             }
         )
-        return handle_outcome(step_name, input_digest, outcome)
+        return handle_outcome(kind, input_digest, outcome)
 
     async def abegin(
         self: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> BeginResult:
-        step_name = name or f"{fn.__module__}.{fn.__qualname__}"
-        input_digest = input_digest_for(step_name, args, kwargs)
+        kind = name or f"{fn.__module__}.{fn.__qualname__}"
+        input_digest = input_digest_for(kind, args, kwargs)
 
-        outcome = await self._runtime.abegin_step(
+        outcome = await self._runtime.abegin(
             {
                 "run_id": self.run_id,
-                "step_name": step_name,
+                "kind": kind,
                 "input_digest": input_digest,
                 "retry": retry or {},
             }
         )
-        return handle_outcome(step_name, input_digest, outcome)
+        return handle_outcome(kind, input_digest, outcome)
 
     def input_digest_for(
-        step_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+        kind: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> str:
         try:
             input_json = json.dumps(
@@ -63,11 +63,11 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
                 ensure_ascii=False,
             )
         except TypeError as exc:
-            raise ValueError(f"step input for {step_name} must be JSON-serializable") from exc
+            raise ValueError(f"step input for {kind} must be JSON-serializable") from exc
         return hashlib.sha256(input_json.encode("utf-8")).hexdigest()
 
     def handle_outcome(
-        step_name: str, input_digest: str, outcome: dict[str, Any]
+        kind: str, input_digest: str, outcome: dict[str, Any]
     ) -> BeginResult:
         match outcome["type"]:
             case "skip_completed":
@@ -76,51 +76,51 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
                 error = outcome["error"]
                 raise DurableStepFailed(f"{error['error_type']}: {error['message']}")
             case "retry_later":
-                raise DurableStepInProgress(f"step retry is scheduled at {outcome['retry_at']}: {step_name}")
+                raise DurableStepInProgress(f"step retry is scheduled at {outcome['retry_at']}: {kind}")
             case "in_progress":
-                raise DurableStepInProgress(f"step is already running: {step_name}")
+                raise DurableStepInProgress(f"step is already running: {kind}")
             case "execute":
-                return "execute", step_name, input_digest
+                return "execute", kind, input_digest
             case other:
                 raise RuntimeError(f"unexpected step outcome: {other}")
 
-    def complete(self: Any, step_name: str, input_digest: str, result: Any) -> None:
+    def complete(self: Any, kind: str, input_digest: str, result: Any) -> None:
         try:
             json.dumps(result)
         except TypeError as exc:
-            raise ValueError(f"step output for {step_name} must be JSON-serializable") from exc
+            raise ValueError(f"step output for {kind} must be JSON-serializable") from exc
 
-        self._runtime.complete_step(
+        self._runtime.complete(
             {
                 "run_id": self.run_id,
-                "step_name": step_name,
+                "kind": kind,
                 "input_digest": input_digest,
                 "output": result,
             }
         )
 
     async def acomplete(
-        self: Any, step_name: str, input_digest: str, result: Any
+        self: Any, kind: str, input_digest: str, result: Any
     ) -> None:
         try:
             json.dumps(result)
         except TypeError as exc:
-            raise ValueError(f"step output for {step_name} must be JSON-serializable") from exc
+            raise ValueError(f"step output for {kind} must be JSON-serializable") from exc
 
-        await self._runtime.acomplete_step(
+        await self._runtime.acomplete(
             {
                 "run_id": self.run_id,
-                "step_name": step_name,
+                "kind": kind,
                 "input_digest": input_digest,
                 "output": result,
             }
         )
 
-    def fail(self: Any, step_name: str, input_digest: str, exc: Exception) -> None:
-        self._runtime.fail_step(
+    def fail(self: Any, kind: str, input_digest: str, exc: Exception) -> None:
+        self._runtime.fail(
             {
                 "run_id": self.run_id,
-                "step_name": step_name,
+                "kind": kind,
                 "input_digest": input_digest,
                 "error": {
                     "error_type": type(exc).__name__,
@@ -132,12 +132,12 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
         )
 
     async def afail(
-        self: Any, step_name: str, input_digest: str, exc: Exception
+        self: Any, kind: str, input_digest: str, exc: Exception
     ) -> None:
-        await self._runtime.afail_step(
+        await self._runtime.afail(
             {
                 "run_id": self.run_id,
-                "step_name": step_name,
+                "kind": kind,
                 "input_digest": input_digest,
                 "error": {
                     "error_type": type(exc).__name__,
@@ -153,17 +153,17 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
         begin_result = await abegin(self, args, kwargs)
         if begin_result[0] == "skip":
             return begin_result[1]
-        _, step_name, input_digest = begin_result
+        _, kind, input_digest = begin_result
 
         try:
             result = fn(self, *args, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
-            await afail(self, step_name, input_digest, exc)
+            await afail(self, kind, input_digest, exc)
             raise
 
-        await acomplete(self, step_name, input_digest, result)
+        await acomplete(self, kind, input_digest, result)
         return result
 
     @functools.wraps(fn)
@@ -171,20 +171,20 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
         begin_result = begin(self, args, kwargs)
         if begin_result[0] == "skip":
             return begin_result[1]
-        _, step_name, input_digest = begin_result
+        _, kind, input_digest = begin_result
 
         try:
             result = fn(self, *args, **kwargs)
         except Exception as exc:
-            fail(self, step_name, input_digest, exc)
+            fail(self, kind, input_digest, exc)
             raise
 
         if inspect.isawaitable(result):
             if inspect.iscoroutine(result):
                 result.close()
-            raise TypeError(f"sync step returned an awaitable: {step_name}")
+            raise TypeError(f"sync step returned an awaitable: {kind}")
 
-        complete(self, step_name, input_digest, result)
+        complete(self, kind, input_digest, result)
         return result
 
     if inspect.iscoroutinefunction(fn):

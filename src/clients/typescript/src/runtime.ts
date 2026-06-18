@@ -4,7 +4,7 @@ import { mkdir, readFile, rmdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
-export type StepOutcome =
+export type Outcome =
   | { type: "execute"; attempt: number }
   | { type: "skip_completed"; output: unknown }
   | { type: "in_progress" }
@@ -12,16 +12,15 @@ export type StepOutcome =
   | { type: "retry_later"; retry_at: string };
 
 export interface Runtime {
-  beginStep(payload: Record<string, unknown>): Promise<StepOutcome>;
-  completeStep(payload: Record<string, unknown>): Promise<void>;
-  failStep(payload: Record<string, unknown>): Promise<void>;
+  begin(payload: Record<string, unknown>): Promise<Outcome>;
+  complete(payload: Record<string, unknown>): Promise<void>;
+  fail(payload: Record<string, unknown>): Promise<void>;
+  list?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
+  heartbeat?(payload: Record<string, unknown>): Promise<{ ok: boolean }>;
   registerRun?(payload: Record<string, unknown>): Promise<void>;
   summary?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
   export?(payload: Record<string, unknown>): Promise<{ body: string; content_type?: string }>;
   registerDataset?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
-  listTasks?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
-  completeTask?(payload: Record<string, unknown>): Promise<void>;
-  failTask?(payload: Record<string, unknown>): Promise<void>;
   memoGet?(payload: Record<string, unknown>): Promise<{ found: boolean; value: unknown }>;
   memoPut?(payload: Record<string, unknown>): Promise<{ ok: boolean }>;
   registerVariants?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
@@ -80,12 +79,12 @@ export class RuntimeClient implements Runtime {
     metadataPath: string,
   ): Promise<RuntimeClient> {
     const serverBin =
-      process.env.DURABLE_EVALS_SERVER_BIN ?? "durable-evals-server";
+      process.env.DURABLE_EVALS_SERVER_BIN ?? "durable-eval";
     const dbPath = join(storageDir, "evals.sqlite");
     const stderr = createWriteStream(join(storageDir, "server.log"), {
       flags: "a",
     });
-    const child = spawn(serverBin, {
+    const child = spawn(serverBin, ["serve"], {
       env: { ...process.env, DURABLE_EVALS_DB: dbPath },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -130,16 +129,24 @@ export class RuntimeClient implements Runtime {
     throw new Error("durable evals server did not become healthy");
   }
 
-  async beginStep(payload: Record<string, unknown>): Promise<StepOutcome> {
-    return (await this.post("/steps/begin", payload)) as StepOutcome;
+  async begin(payload: Record<string, unknown>): Promise<Outcome> {
+    return (await this.post("/tasks/begin", payload)) as Outcome;
   }
 
-  async completeStep(payload: Record<string, unknown>): Promise<void> {
-    await this.post("/steps/complete", payload);
+  async complete(payload: Record<string, unknown>): Promise<void> {
+    await this.post("/tasks/complete", payload);
   }
 
-  async failStep(payload: Record<string, unknown>): Promise<void> {
-    await this.post("/steps/fail", payload);
+  async fail(payload: Record<string, unknown>): Promise<void> {
+    await this.post("/tasks/fail", payload);
+  }
+
+  async list(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
+    return (await this.post("/tasks/list", payload)) as Array<Record<string, unknown>>;
+  }
+
+  async heartbeat(payload: Record<string, unknown>): Promise<{ ok: boolean }> {
+    return (await this.post("/tasks/heartbeat", payload)) as { ok: boolean };
   }
 
   async registerRun(payload: Record<string, unknown>): Promise<void> {
@@ -156,18 +163,6 @@ export class RuntimeClient implements Runtime {
 
   async registerDataset(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
     return (await this.post("/datasets/register", payload)) as Record<string, unknown>;
-  }
-
-  async listTasks(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
-    return (await this.post("/datasets/tasks/list", payload)) as Array<Record<string, unknown>>;
-  }
-
-  async completeTask(payload: Record<string, unknown>): Promise<void> {
-    await this.post("/datasets/tasks/complete", payload);
-  }
-
-  async failTask(payload: Record<string, unknown>): Promise<void> {
-    await this.post("/datasets/tasks/fail", payload);
   }
 
   async memoGet(payload: Record<string, unknown>): Promise<{ found: boolean; value: unknown }> {

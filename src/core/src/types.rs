@@ -7,10 +7,13 @@ pub struct Health {
     pub ok: bool,
 }
 
+/// A unit of work is content-addressed by `(run_id, kind, input_digest)`. A `kind` is
+/// the name of either a step (a group of one) or a dataset (a pre-registered set of
+/// tasks) — e.g. "score" or "telecom". The same begin/complete/fail path serves both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BeginStepRequest {
+pub struct BeginRequest {
     pub run_id: String,
-    pub step_name: String,
+    pub kind: String,
     pub input_digest: String,
     #[serde(default)]
     pub config: Value,
@@ -27,20 +30,18 @@ pub struct BeginStepRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompleteStepRequest {
+pub struct CompleteRequest {
     pub run_id: String,
-    pub step_name: String,
+    pub kind: String,
     pub input_digest: String,
     #[serde(default)]
     pub output: Value,
-    #[serde(default)]
-    pub artifacts: Vec<ArtifactInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FailStepRequest {
+pub struct FailRequest {
     pub run_id: String,
-    pub step_name: String,
+    pub kind: String,
     pub input_digest: String,
     pub error: ErrorInfo,
 }
@@ -55,7 +56,7 @@ pub struct RegisterRunRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatasetTaskInput {
+pub struct TaskInput {
     pub input_digest: String,
     #[serde(default)]
     pub input: Value,
@@ -65,34 +66,19 @@ pub struct DatasetTaskInput {
     pub category: Option<String>,
 }
 
+/// Pre-register a known set of tasks under a `kind` (a "dataset"). Steps skip this and
+/// let `begin` upsert their single task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterDatasetRequest {
     pub run_id: String,
-    pub dataset_name: String,
-    pub tasks: Vec<DatasetTaskInput>,
+    pub kind: String,
+    pub tasks: Vec<TaskInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompleteTaskRequest {
+pub struct ListRequest {
     pub run_id: String,
-    pub dataset_name: String,
-    pub input_digest: String,
-    pub output: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FailTaskRequest {
-    pub run_id: String,
-    pub dataset_name: String,
-    pub input_digest: String,
-    pub error: ErrorInfo,
-    pub max_attempts: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListTasksRequest {
-    pub run_id: String,
-    pub dataset_name: String,
+    pub kind: String,
     #[serde(default)]
     pub statuses: Vec<String>,
     /// Optional category filter; empty means every category.
@@ -103,7 +89,7 @@ pub struct ListTasksRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub run_id: String,
-    pub dataset_name: String,
+    pub kind: String,
     pub input_digest: String,
     #[serde(default)]
     pub label: Option<String>,
@@ -159,11 +145,11 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Delay in milliseconds before a failed step on `attempt` (1-based) may retry.
+    /// Delay in milliseconds before a failed task on `attempt` (1-based) may retry.
     /// Exponential backoff `base_delay_ms * 2^(attempt-1)`, capped at `max_delay_ms`,
     /// with optional jitter in `[0.5, 1.0)` derived from `jitter_seed` so we avoid
     /// pulling in a random-number dependency. A `base_delay_ms` of 0 disables backoff
-    /// and the step retries immediately.
+    /// and the task retries immediately.
     pub fn backoff_delay_ms(&self, attempt: u32, jitter_seed: u64) -> u64 {
         if self.base_delay_ms == 0 {
             return 0;
@@ -231,51 +217,6 @@ pub struct ErrorInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FailureRecord {
-    pub run_id: String,
-    pub step_name: String,
-    pub input_digest: String,
-    pub attempt: u32,
-    pub failure_class: FailureClass,
-    pub error_type: String,
-    pub message: String,
-    pub stack: Option<String>,
-    pub retryable: bool,
-    pub timestamp: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtifactInput {
-    pub artifact_id: String,
-    pub name: String,
-    pub kind: String,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub inline_json: Option<Value>,
-    pub sha256: String,
-    pub size: u64,
-    #[serde(default)]
-    pub valid: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtifactRecord {
-    pub artifact_id: String,
-    pub run_id: String,
-    pub step_name: String,
-    pub input_digest: String,
-    pub name: String,
-    pub kind: String,
-    pub path: Option<String>,
-    pub inline_json: Option<Value>,
-    pub sha256: String,
-    pub size: u64,
-    pub valid: bool,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterVariantsRequest {
     pub run_id: String,
     pub dimension: String,
@@ -300,9 +241,9 @@ pub struct VariantRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatStepRequest {
+pub struct HeartbeatRequest {
     pub run_id: String,
-    pub step_name: String,
+    pub kind: String,
     pub input_digest: String,
     pub worker_id: String,
     pub lease_seconds: u32,
@@ -311,7 +252,7 @@ pub struct HeartbeatStepRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEventRequest {
     pub run_id: String,
-    pub dataset_name: String,
+    pub kind: String,
     pub task_id: String,
     pub attempt: u32,
     pub event_type: String,
@@ -325,7 +266,7 @@ pub struct TraceEventRequest {
 pub struct TraceEventRecord {
     pub id: i64,
     pub run_id: String,
-    pub dataset_name: String,
+    pub kind: String,
     pub task_id: String,
     pub attempt: u32,
     pub event_index: u32,
@@ -369,9 +310,7 @@ pub struct RunSummary {
     pub name: Option<String>,
     pub config: Value,
     pub config_digest: String,
-    pub step_counts: BTreeMap<String, u32>,
     pub task_counts: BTreeMap<String, u32>,
-    pub artifact_count: u32,
     pub failure_counts: BTreeMap<String, u32>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
@@ -388,10 +327,6 @@ pub struct ExportRequest {
 pub enum ExportKind {
     ManifestJson,
     TaskResultsJsonl,
-    FailureReportJson,
-    FailureReportCsv,
-    AggregateMetricsJson,
-    AggregateMetricsCsv,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,7 +337,7 @@ pub struct ExportResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum StepOutcome {
+pub enum Outcome {
     Execute { attempt: u32 },
     SkipCompleted { output: Value },
     InProgress,

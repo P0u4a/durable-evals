@@ -19,6 +19,24 @@ A dataset is a collection of tasks. Tasks may carry an optional `category`, so y
 
 A step is a single unit of work that is part of an eval's method. For example, scoring is a step.
 
+Under the hood there is just one primitive: a content-addressed **task** keyed by
+`(run_id, kind, input_digest)`, where `kind` is a step name or a dataset name. A step
+is a group of one; a dataset is a pre-registered group. Both resume and retry the same way.
+
+## Running an eval
+
+Write your eval as a normal script (a "harness") using the SDK, then run it with the CLI:
+
+```
+durable-eval run harness.py        # runs your eval, manages the runtime, resumes on rerun
+durable-eval run harness.py --fresh # ignore the cache and start over
+durable-eval run harness.ts -- --only math   # args after the harness are forwarded to it
+```
+
+`durable-eval run` starts the runtime, points your harness's client at it, streams its
+output, and exits with its status. Re-running resumes from where the last run left off.
+Harness language is detected by extension (`.py` → Python, `.js`/`.mjs` → Node,
+`.ts` → Node via `tsx`).
 
 ## Python
 
@@ -160,14 +178,14 @@ await trace.terminationEvent({ reason: "done" });
 
 ## Runtime
 
-Clients use `DURABLE_EVALS_RUNTIME_URL` when it is set. Otherwise they start
-`durable-evals-server` automatically and store metadata plus `evals.sqlite`
-under `.durable/` by default.
+`durable-eval run` manages the runtime for you. If you run a harness directly instead,
+clients use `DURABLE_EVALS_RUNTIME_URL` when it is set, and otherwise auto-spawn
+`durable-eval serve`, storing metadata plus `evals.sqlite` under `.durable/` by default.
 
 Useful environment variables:
 
 - `DURABLE_EVALS_RUNTIME_URL`: Connect to an existing runtime server.
-- `DURABLE_EVALS_SERVER_BIN`: Override the server binary path.
+- `DURABLE_EVALS_SERVER_BIN`: Override the `durable-eval` binary path used for auto-spawn.
 - `DURABLE_EVALS_DB`: Set the SQLite database path for the server.
 - `DURABLE_EVALS_ADDR`: Set the server bind address.
 - `DURABLE_EVALS_TOKEN`: Require `Authorization: Bearer <token>` on every

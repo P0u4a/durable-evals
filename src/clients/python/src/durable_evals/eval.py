@@ -69,13 +69,13 @@ class DurableEval:
 
     def trace_task(
         self,
-        dataset_name: str,
+        kind: str,
         *,
         task: Any = None,
         task_id: str | None = None,
         attempt: int = 1,
     ) -> "TraceTask":
-        return TraceTask(self, dataset_name, _resolve_task_id(task, task_id), attempt)
+        return TraceTask(self, kind, _resolve_task_id(task, task_id), attempt)
 
     def memo(self, key: Any, fn: Callable[[], Any]) -> Any:
         key_digest = _json_digest(key)
@@ -131,25 +131,24 @@ class Dataset:
         progress: Callable[[dict[str, int]], None] | None = None,
         max_attempts: int = 3,
     ) -> list[Any]:
-        records = self._register(id, category)
+        # Register the full set first so categories / generation are recorded, then
+        # drive every unique task digest through the unified begin/complete/fail path.
+        self._register(id, category)
         outputs: list[Any] = [None] * len(self.tasks)
-        runnable: list[tuple[list[int], Any, dict[str, Any]]] = []
-        by_digest = {record["input_digest"]: record for record in records}
-        for digest, indexes in self._positions().items():
-            record = by_digest[digest]
-            if record["status"] == "succeeded":
-                for index in indexes:
-                    outputs[index] = record.get("output")
-            elif record["status"] != "terminal" and self._in_categories(record, categories):
-                runnable.append((indexes, self.tasks[indexes[0]], record))
+        retry = {"max_attempts": max_attempts}
+        runnable = [
+            (indexes, self.tasks[indexes[0]], digest)
+            for digest, indexes in self._positions().items()
+            if self._in_categories(self.tasks[indexes[0]], category, categories)
+        ]
 
         if concurrency <= 1:
             for item in runnable:
-                self._run_one(item, run, outputs, progress, max_attempts)
+                self._run_one(item, run, outputs, progress, retry)
         else:
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
                 futures = [
-                    executor.submit(self._run_one, item, run, outputs, progress, max_attempts)
+                    executor.submit(self._run_one, item, run, outputs, progress, retry)
                     for item in runnable
                 ]
                 # Surfacing the first exception would abort sibling tasks; a failing task
@@ -169,34 +168,49 @@ class Dataset:
         progress: Callable[[dict[str, int]], None] | None = None,
         max_attempts: int = 3,
     ) -> list[Any]:
-        records = await self._aregister(id, category)
+        await self._aregister(id, category)
         outputs: list[Any] = [None] * len(self.tasks)
+        retry = {"max_attempts": max_attempts}
         semaphore = asyncio.Semaphore(concurrency)
-        by_digest = {record["input_digest"]: record for record in records}
 
-        async def run_one(indexes: list[int], task: Any, record: dict[str, Any]) -> None:
+        async def run_one(indexes: list[int], task: Any, digest: str) -> None:
             async with semaphore:
+                outcome = await self.eval._runtime.abegin(
+                    {
+                        "run_id": self.eval.run_id,
+                        "kind": self.dataset_name,
+                        "input_digest": digest,
+                        "retry": retry,
+                    }
+                )
+                kind = outcome["type"]
+                if kind == "skip_completed":
+                    for index in indexes:
+                        outputs[index] = outcome["output"]
+                    return
+                if kind != "execute":
+                    # in_progress / retry_later / failed_terminal: leave positions None.
+                    return
                 try:
                     result = run(task)
                     if inspect.isawaitable(result):
                         result = await result
                 except Exception as exc:
                     # Record and move on so one bad task doesn't cancel the dataset.
-                    await self.eval._runtime.afail_task(
+                    await self.eval._runtime.afail(
                         {
                             "run_id": self.eval.run_id,
-                            "dataset_name": self.dataset_name,
-                            "input_digest": record["input_digest"],
+                            "kind": self.dataset_name,
+                            "input_digest": digest,
                             "error": _error_payload(exc),
-                            "max_attempts": max_attempts,
                         }
                     )
                     return
-                await self.eval._runtime.acomplete_task(
+                await self.eval._runtime.acomplete(
                     {
                         "run_id": self.eval.run_id,
-                        "dataset_name": self.dataset_name,
-                        "input_digest": record["input_digest"],
+                        "kind": self.dataset_name,
+                        "input_digest": digest,
                         "output": result,
                     }
                 )
@@ -205,35 +219,39 @@ class Dataset:
                 if progress:
                     progress(await self._asummary())
 
-        tasks = []
-        for digest, indexes in self._positions().items():
-            record = by_digest[digest]
-            if record["status"] == "succeeded":
-                for index in indexes:
-                    outputs[index] = record.get("output")
-            elif record["status"] != "terminal" and self._in_categories(record, categories):
-                tasks.append(asyncio.create_task(run_one(indexes, self.tasks[indexes[0]], record)))
+        tasks = [
+            asyncio.create_task(run_one(indexes, self.tasks[indexes[0]], digest))
+            for digest, indexes in self._positions().items()
+            if self._in_categories(self.tasks[indexes[0]], category, categories)
+        ]
         if tasks:
             await asyncio.gather(*tasks)
         return outputs
 
     @staticmethod
-    def _in_categories(record: dict[str, Any], categories: list[str] | None) -> bool:
-        if not categories:
+    def _in_categories(
+        task: Any,
+        category: Callable[[Any], str] | None,
+        categories: list[str] | None,
+    ) -> bool:
+        # Filter client-side against the category function applied to the
+        # representative task for this digest, so we never begin() a task that
+        # was filtered out of this run.
+        if not categories or category is None:
             return True
-        return record.get("category") in categories
+        return str(category(task)) in categories
 
     def summary(self) -> dict[str, int]:
         return self._counts(
-            self.eval._runtime.list_tasks(
-                {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": []}
+            self.eval._runtime.list(
+                {"run_id": self.eval.run_id, "kind": self.dataset_name, "statuses": []}
             )
         )
 
     async def _asummary(self) -> dict[str, int]:
         return self._counts(
-            await self.eval._runtime.alist_tasks(
-                {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": []}
+            await self.eval._runtime.alist(
+                {"run_id": self.eval.run_id, "kind": self.dataset_name, "statuses": []}
             )
         )
 
@@ -255,8 +273,8 @@ class Dataset:
         return self._tasks(["pending"])
 
     def _tasks(self, statuses: list[str]) -> list[dict[str, Any]]:
-        return self.eval._runtime.list_tasks(
-            {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": statuses}
+        return self.eval._runtime.list(
+            {"run_id": self.eval.run_id, "kind": self.dataset_name, "statuses": statuses}
         )
 
     def _positions(self) -> dict[str, list[int]]:
@@ -286,54 +304,63 @@ class Dataset:
         self,
         id: Callable[[Any], str] | None,
         category: Callable[[Any], str] | None,
-    ) -> list[dict[str, Any]]:
-        self.eval._runtime.register_dataset(
+    ) -> dict[str, Any]:
+        return self.eval._runtime.register_dataset(
             {
                 "run_id": self.eval.run_id,
-                "dataset_name": self.dataset_name,
+                "kind": self.dataset_name,
                 "tasks": self._task_payloads(id, category),
             }
-        )
-        return self.eval._runtime.list_tasks(
-            {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": []}
         )
 
     async def _aregister(
         self,
         id: Callable[[Any], str] | None,
         category: Callable[[Any], str] | None,
-    ) -> list[dict[str, Any]]:
-        await self.eval._runtime.aregister_dataset(
+    ) -> dict[str, Any]:
+        return await self.eval._runtime.aregister_dataset(
             {
                 "run_id": self.eval.run_id,
-                "dataset_name": self.dataset_name,
+                "kind": self.dataset_name,
                 "tasks": self._task_payloads(id, category),
             }
-        )
-        return await self.eval._runtime.alist_tasks(
-            {"run_id": self.eval.run_id, "dataset_name": self.dataset_name, "statuses": []}
         )
 
     def _run_one(
         self,
-        item: tuple[list[int], Any, dict[str, Any]],
+        item: tuple[list[int], Any, str],
         run: Callable[[Any], Any],
         outputs: list[Any],
         progress: Callable[[dict[str, int]], None] | None,
-        max_attempts: int,
+        retry: dict[str, Any],
     ) -> None:
-        indexes, task, record = item
+        indexes, task, digest = item
+        outcome = self.eval._runtime.begin(
+            {
+                "run_id": self.eval.run_id,
+                "kind": self.dataset_name,
+                "input_digest": digest,
+                "retry": retry,
+            }
+        )
+        kind = outcome["type"]
+        if kind == "skip_completed":
+            for index in indexes:
+                outputs[index] = outcome["output"]
+            return
+        if kind != "execute":
+            # in_progress / retry_later / failed_terminal: leave positions None.
+            return
         try:
             result = run(task)
         except Exception as exc:
             # Record and move on so one bad task doesn't abort the dataset.
-            self.eval._runtime.fail_task(
+            self.eval._runtime.fail(
                 {
                     "run_id": self.eval.run_id,
-                    "dataset_name": self.dataset_name,
-                    "input_digest": record["input_digest"],
+                    "kind": self.dataset_name,
+                    "input_digest": digest,
                     "error": _error_payload(exc),
-                    "max_attempts": max_attempts,
                 }
             )
             return
@@ -341,11 +368,11 @@ class Dataset:
             if inspect.iscoroutine(result):
                 result.close()
             raise TypeError("sync dataset callback returned an awaitable")
-        self.eval._runtime.complete_task(
+        self.eval._runtime.complete(
             {
                 "run_id": self.eval.run_id,
-                "dataset_name": self.dataset_name,
-                "input_digest": record["input_digest"],
+                "kind": self.dataset_name,
+                "input_digest": digest,
                 "output": result,
             }
         )
@@ -356,9 +383,9 @@ class Dataset:
 
 
 class TraceTask(AbstractContextManager["TraceTask"]):
-    def __init__(self, eval_run: DurableEval, dataset_name: str, task_id: str, attempt: int):
+    def __init__(self, eval_run: DurableEval, kind: str, task_id: str, attempt: int):
         self.eval = eval_run
-        self.dataset_name = dataset_name
+        self.kind = kind
         self.task_id = task_id
         self.attempt = attempt
 
@@ -372,7 +399,7 @@ class TraceTask(AbstractContextManager["TraceTask"]):
         return self.eval._runtime.trace_event(
             {
                 "run_id": self.eval.run_id,
-                "dataset_name": self.dataset_name,
+                "kind": self.kind,
                 "task_id": self.task_id,
                 "attempt": self.attempt,
                 "event_type": event_type,
