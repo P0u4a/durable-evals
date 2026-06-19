@@ -122,8 +122,29 @@ class Runtime:
         return payload["variants"]
 
     def trace_event(self, payload):
-        self.trace_events.append(payload)
-        return {**payload, "event_index": len(self.trace_events)}
+        record = {**payload, "event_index": len(self.trace_events)}
+        self.trace_events.append(record)
+        return record
+
+    def list_trace_events(self, payload):
+        # Mirror the server's filtering: run_id is required, every other field
+        # narrows the result, and an empty event_type list means "any".
+        kind = payload.get("kind")
+        task_id = payload.get("task_id")
+        attempt = payload.get("attempt")
+        event_types = payload.get("event_type") or []
+        return [
+            event
+            for event in self.trace_events
+            if event["run_id"] == payload["run_id"]
+            and (kind is None or event["kind"] == kind)
+            and (task_id is None or event["task_id"] == task_id)
+            and (attempt is None or event["attempt"] == attempt)
+            and (not event_types or event["event_type"] in event_types)
+        ]
+
+    async def alist_trace_events(self, payload):
+        return self.list_trace_events(payload)
 
     def summary(self, payload):
         return {"run_id": payload["run_id"]}
@@ -306,6 +327,61 @@ def test_trace_task_accepts_task_or_task_id():
         eval_run.trace_task("tasks")
     with pytest.raises(ValueError, match="exactly one"):
         eval_run.trace_task("tasks", task=task, task_id="x")
+
+
+def test_list_traces_fetches_all_or_by_task_with_filters():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+    task = {"x": 1}
+
+    with eval_run.trace_task("tasks", task=task) as first:
+        first.model_request({"messages": []})
+        first.tool_call({"name": "click"})
+    with eval_run.trace_task("tasks", task=task, attempt=2) as second:
+        second.model_request({"messages": []})
+    with eval_run.trace_task("other", task_id="solo") as other:
+        other.scoring_event({"score": 1})
+
+    # Fetch every trace event for the run.
+    assert len(eval_run.list_traces()) == 4
+
+    # Fetch a specific task by id (here keyed by the task input digest).
+    by_task = eval_run.list_traces(task=task)
+    assert [event["event_type"] for event in by_task] == [
+        "model_request",
+        "tool_call",
+        "model_request",
+    ]
+    assert eval_run.list_traces(task_id="solo") == eval_run.list_traces(kind="other")
+    assert eval_run.list_traces(task_id="missing") == []
+
+    # Server-side filters compose: event type, attempt, kind.
+    assert len(eval_run.list_traces(event_type="model_request")) == 2
+    pair = eval_run.list_traces(
+        task=task, event_type=["model_request", "tool_call"], attempt=1
+    )
+    assert [event["event_type"] for event in pair] == ["model_request", "tool_call"]
+
+
+def test_list_traces_rejects_task_and_task_id_together():
+    eval_run = DurableEval(run_id="run", runtime=Runtime())
+    with pytest.raises(ValueError, match="at most one"):
+        eval_run.list_traces(task={"x": 1}, task_id="x")
+
+
+def test_alist_traces_filters_by_event_type():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+
+    with eval_run.trace_task("tasks", task_id="task") as trace:
+        trace.model_request({"messages": []})
+        trace.tool_call({"name": "click"})
+
+    async def scenario():
+        return await eval_run.alist_traces(task_id="task", event_type="tool_call")
+
+    events = asyncio.run(scenario())
+    assert [event["event_type"] for event in events] == ["tool_call"]
 
 
 def test_variants_trace_and_export_helpers_are_thin_runtime_calls():

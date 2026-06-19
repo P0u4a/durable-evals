@@ -128,6 +128,9 @@ class RuntimeClient:
     def trace_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/traces/events", payload)
 
+    def list_trace_events(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return self._post("/traces/list", payload)
+
     def memo_get(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/memos/get", payload)
 
@@ -157,6 +160,11 @@ class RuntimeClient:
 
     async def amemo_put(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._apost("/memos/put", payload)
+
+    async def alist_trace_events(
+        self, payload: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        return await self._apost("/traces/list", payload)
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = httpx.post(

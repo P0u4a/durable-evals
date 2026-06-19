@@ -133,6 +133,24 @@ class Runtime implements DurableRuntime {
     return { ...payload, event_index: this.traceEvents.length };
   }
 
+  async listTraceEvents(payload: Payload): Promise<Payload[]> {
+    // Mirror the server's filtering: run_id is required, every other field
+    // narrows the result, and an empty event_type list means "any".
+    const kind = payload.kind ?? null;
+    const taskId = payload.task_id ?? null;
+    const attempt = payload.attempt ?? null;
+    const eventTypes = (payload.event_type as string[]) ?? [];
+    return this.traceEvents.filter(
+      (event) =>
+        event.run_id === payload.run_id &&
+        (kind === null || event.kind === kind) &&
+        (taskId === null || event.task_id === taskId) &&
+        (attempt === null || event.attempt === attempt) &&
+        (eventTypes.length === 0 ||
+          eventTypes.includes(String(event.event_type))),
+    );
+  }
+
   async summary(payload: Payload): Promise<Payload> {
     return { run_id: payload.run_id };
   }
@@ -466,6 +484,58 @@ test("traceTask requires exactly one of task or taskId", async () => {
   assert.throws(() => evalRun.traceTask("tasks", {}), TypeError);
   assert.throws(
     () => evalRun.traceTask("tasks", { task: { q: 1 }, taskId: "task" }),
+    TypeError,
+  );
+});
+
+test("listTraces fetches all or by task with server-side filters", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  const task = { q: 1 };
+
+  const first = evalRun.traceTask("tasks", { task });
+  await first.modelRequest({ messages: [] });
+  await first.toolCall({ name: "click" });
+  const second = evalRun.traceTask("tasks", { task, attempt: 2 });
+  await second.modelRequest({ messages: [] });
+  await evalRun.traceTask("other", { taskId: "solo" }).scoringEvent({ score: 1 });
+
+  // Fetch every trace event for the run.
+  assert.equal((await evalRun.listTraces()).length, 4);
+
+  // Fetch a specific task by id (here keyed by the task input digest).
+  const byTask = await evalRun.listTraces({ task });
+  assert.deepEqual(
+    byTask.map((event) => event.event_type),
+    ["model_request", "tool_call", "model_request"],
+  );
+  assert.deepEqual(
+    await evalRun.listTraces({ taskId: "solo" }),
+    await evalRun.listTraces({ kind: "other" }),
+  );
+  assert.deepEqual(await evalRun.listTraces({ taskId: "missing" }), []);
+
+  // Server-side filters compose: event type, attempt, kind.
+  assert.equal(
+    (await evalRun.listTraces({ eventType: "model_request" })).length,
+    2,
+  );
+  const pair = await evalRun.listTraces({
+    task,
+    eventType: ["model_request", "tool_call"],
+    attempt: 1,
+  });
+  assert.deepEqual(
+    pair.map((event) => event.event_type),
+    ["model_request", "tool_call"],
+  );
+});
+
+test("listTraces rejects task and taskId together", async () => {
+  const runtime = new Runtime();
+  const evalRun = new DurableEval({ runId: "run", runtime });
+  await assert.rejects(
+    () => evalRun.listTraces({ task: { q: 1 }, taskId: "x" }),
     TypeError,
   );
 });

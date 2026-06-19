@@ -77,6 +77,57 @@ class DurableEval:
     ) -> "TraceTask":
         return TraceTask(self, kind, _resolve_task_id(task, task_id), attempt)
 
+    def list_traces(
+        self,
+        *,
+        kind: str | None = None,
+        task: Any = None,
+        task_id: str | None = None,
+        event_type: str | Iterable[str] | None = None,
+        attempt: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._runtime.list_trace_events(
+            self._trace_query(kind, task, task_id, event_type, attempt)
+        )
+
+    async def alist_traces(
+        self,
+        *,
+        kind: str | None = None,
+        task: Any = None,
+        task_id: str | None = None,
+        event_type: str | Iterable[str] | None = None,
+        attempt: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._runtime.alist_trace_events(
+            self._trace_query(kind, task, task_id, event_type, attempt)
+        )
+
+    def _trace_query(
+        self,
+        kind: str | None,
+        task: Any,
+        task_id: str | None,
+        event_type: str | Iterable[str] | None,
+        attempt: int | None,
+    ) -> dict[str, Any]:
+        if task is not None and task_id is not None:
+            raise ValueError("provide at most one of task or task_id")
+        resolved_task_id = _json_digest(task) if task is not None else task_id
+        if isinstance(event_type, str):
+            event_types = [event_type]
+        elif event_type is None:
+            event_types = []
+        else:
+            event_types = list(event_type)
+        return {
+            "run_id": self.run_id,
+            "kind": kind,
+            "task_id": resolved_task_id,
+            "attempt": attempt,
+            "event_type": event_types,
+        }
+
     def memo(self, key: Any, fn: Callable[[], Any]) -> Any:
         key_digest = _json_digest(key)
         record = self._runtime.memo_get({"run_id": self.run_id, "key_digest": key_digest})

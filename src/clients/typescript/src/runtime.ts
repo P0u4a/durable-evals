@@ -25,6 +25,9 @@ export interface Runtime {
   memoPut?(payload: Record<string, unknown>): Promise<{ ok: boolean }>;
   registerVariants?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
   traceEvent?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  listTraceEvents?(
+    payload: Record<string, unknown>,
+  ): Promise<Array<Record<string, unknown>>>;
 }
 
 export class RuntimeClient implements Runtime {
@@ -179,6 +182,14 @@ export class RuntimeClient implements Runtime {
 
   async traceEvent(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
     return (await this.post("/traces/events", payload)) as Record<string, unknown>;
+  }
+
+  async listTraceEvents(
+    payload: Record<string, unknown>,
+  ): Promise<Array<Record<string, unknown>>> {
+    return (await this.post("/traces/list", payload)) as Array<
+      Record<string, unknown>
+    >;
   }
 
   private async post(

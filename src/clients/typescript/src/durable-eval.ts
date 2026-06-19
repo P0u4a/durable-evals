@@ -94,6 +94,39 @@ export class DurableEval {
     return new TraceTask(this, datasetName, resolveTaskId(options), options.attempt ?? 1);
   }
 
+  async listTraces(
+    options: {
+      kind?: string;
+      task?: unknown;
+      taskId?: string;
+      eventType?: string | string[];
+      attempt?: number;
+    } = {},
+  ): Promise<Array<Record<string, unknown>>> {
+    const runtime = await this.getRuntime();
+    assertRuntimeMethod(runtime.listTraceEvents, "listTraceEvents");
+    if (options.task !== undefined && options.taskId !== undefined) {
+      throw new TypeError("provide at most one of task or taskId");
+    }
+    const taskId =
+      options.task !== undefined
+        ? digestJson(options.task)
+        : options.taskId ?? null;
+    const eventType =
+      options.eventType === undefined
+        ? []
+        : Array.isArray(options.eventType)
+          ? options.eventType
+          : [options.eventType];
+    return await runtime.listTraceEvents({
+      run_id: this.runId,
+      kind: options.kind ?? null,
+      task_id: taskId,
+      attempt: options.attempt ?? null,
+      event_type: eventType,
+    });
+  }
+
   async memo<TValue>(
     key: unknown,
     fn: () => TValue | Promise<TValue>,
