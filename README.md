@@ -116,6 +116,17 @@ with eval_run.trace_task("browser_tasks", task=task) as trace:
     trace.termination_event({"reason": "done"})
 ```
 
+Read traces back. `list_traces` returns every trace event for the run by default. You can filter by any combination of `kind`, `task`/`task_id`,
+`event_type` (a single type or a list), and `attempt`:
+
+```python
+all_events = eval_run.list_traces()                       # every event for the run
+task_events = eval_run.list_traces(task=task)             # one task by id
+model_calls = eval_run.list_traces(
+    kind="browser_tasks", event_type=["model_request", "model_response"]
+)
+```
+
 ## TypeScript
 
 ```ts
@@ -174,6 +185,18 @@ await trace.modelRequest({ messages: [] });
 await trace.toolCall({ name: "browser.click" });
 await trace.toolResult({ ok: true });
 await trace.terminationEvent({ reason: "done" });
+```
+
+Read traces back. `listTraces` returns every trace event for the run by default. You can filter by any combination of `kind`, `task`/`taskId`,
+`eventType` (a single type or a list), and `attempt`:
+
+```ts
+const allEvents = await evalRun.listTraces();              // every event for the run
+const taskEvents = await evalRun.listTraces({ task });     // one task by id
+const modelCalls = await evalRun.listTraces({
+  kind: "browserTasks",
+  eventType: ["model_request", "model_response"],
+});
 ```
 
 ## Runtime
