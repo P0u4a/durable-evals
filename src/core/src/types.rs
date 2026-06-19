@@ -262,6 +262,22 @@ pub struct TraceEventRequest {
     pub artifact_ids: Vec<String>,
 }
 
+/// Query for trace events. `run_id` is required; every other field narrows the
+/// result server-side. Omit them all to fetch every trace event for the run, or
+/// set `task_id` to fetch a single task's events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTraceEventsRequest {
+    pub run_id: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    #[serde(default)]
+    pub event_type: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEventRecord {
     pub id: i64,

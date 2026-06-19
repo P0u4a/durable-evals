@@ -473,19 +473,25 @@ impl SqliteStore {
 
     pub fn list_trace_events(
         &self,
-        run_id: &str,
-        kind: &str,
-        task_id: &str,
+        req: ListTraceEventsRequest,
     ) -> Result<Vec<TraceEventRecord>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT id, run_id, kind, task_id, attempt, event_index, event_type,
                     payload_json, artifact_ids_json, created_at
              FROM trace_events
-             WHERE run_id = ?1 AND kind = ?2 AND task_id = ?3
-             ORDER BY attempt, event_index",
+             WHERE run_id = ?1
+               AND (?2 IS NULL OR kind = ?2)
+               AND (?3 IS NULL OR task_id = ?3)
+               AND (?4 IS NULL OR attempt = ?4)
+               AND (?5 = '[]' OR event_type IN (SELECT value FROM json_each(?5)))
+             ORDER BY kind, task_id, attempt, event_index",
         )?;
-        let rows = stmt.query_map(params![run_id, kind, task_id], trace_from_row)?;
+        let event_types = serde_json::to_string(&req.event_type)?;
+        let rows = stmt.query_map(
+            params![req.run_id, req.kind, req.task_id, req.attempt, event_types],
+            trace_from_row,
+        )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::Sqlite)
     }
@@ -741,13 +747,8 @@ impl Store for SqliteStore {
     fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord> {
         self.add_trace_event(req)
     }
-    fn list_trace_events(
-        &self,
-        run_id: &str,
-        kind: &str,
-        task_id: &str,
-    ) -> Result<Vec<TraceEventRecord>> {
-        self.list_trace_events(run_id, kind, task_id)
+    fn list_trace_events(&self, req: ListTraceEventsRequest) -> Result<Vec<TraceEventRecord>> {
+        self.list_trace_events(req)
     }
     fn memo_get(&self, req: MemoGetRequest) -> Result<MemoGetResponse> {
         self.memo_get(req)
@@ -932,6 +933,73 @@ mod tests {
             store.begin(begin_req()).expect("begin completed"),
             Outcome::SkipCompleted { output } if output == json!({"ok": true})
         ));
+    }
+
+    fn add_event(store: &SqliteStore, kind: &str, task_id: &str, attempt: u32, event_type: &str) {
+        store
+            .add_trace_event(TraceEventRequest {
+                run_id: "run".to_string(),
+                kind: kind.to_string(),
+                task_id: task_id.to_string(),
+                attempt,
+                event_type: event_type.to_string(),
+                payload: Value::Null,
+                artifact_ids: vec![],
+            })
+            .expect("add trace event");
+    }
+
+    fn trace_query(
+        store: &SqliteStore,
+        kind: Option<&str>,
+        task_id: Option<&str>,
+        attempt: Option<u32>,
+        event_type: Vec<&str>,
+    ) -> Vec<String> {
+        store
+            .list_trace_events(ListTraceEventsRequest {
+                run_id: "run".to_string(),
+                kind: kind.map(str::to_string),
+                task_id: task_id.map(str::to_string),
+                attempt,
+                event_type: event_type.into_iter().map(str::to_string).collect(),
+            })
+            .expect("list trace events")
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect()
+    }
+
+    #[test]
+    fn list_trace_events_filters_server_side() {
+        let store = store();
+        add_event(&store, "tasks", "a", 1, "model_request");
+        add_event(&store, "tasks", "a", 1, "tool_call");
+        add_event(&store, "tasks", "a", 2, "model_request");
+        add_event(&store, "other", "b", 1, "scoring_event");
+
+        // No filters: every event for the run, grouped by kind/task/attempt/index.
+        assert_eq!(
+            trace_query(&store, None, None, None, vec![]),
+            vec!["scoring_event", "model_request", "tool_call", "model_request"]
+        );
+        // A specific task by id.
+        assert_eq!(
+            trace_query(&store, None, Some("a"), None, vec![]),
+            vec!["model_request", "tool_call", "model_request"]
+        );
+        // event_type, attempt, and task_id compose.
+        assert_eq!(
+            trace_query(&store, None, Some("a"), Some(1), vec!["model_request"]),
+            vec!["model_request"]
+        );
+        // kind filter.
+        assert_eq!(
+            trace_query(&store, Some("other"), None, None, vec![]),
+            vec!["scoring_event"]
+        );
+        // No matches.
+        assert!(trace_query(&store, None, Some("missing"), None, vec![]).is_empty());
     }
 
     fn task(digest: &str, input: Value) -> TaskInput {

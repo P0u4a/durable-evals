@@ -60,11 +60,9 @@ impl Runtime {
 
     pub fn list_trace_events(
         &self,
-        run_id: &str,
-        kind: &str,
-        task_id: &str,
+        req: ListTraceEventsRequest,
     ) -> Result<Vec<TraceEventRecord>> {
-        self.store.list_trace_events(run_id, kind, task_id)
+        self.store.list_trace_events(req)
     }
 
     pub fn memo_get(&self, req: MemoGetRequest) -> Result<MemoGetResponse> {

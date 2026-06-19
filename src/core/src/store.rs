@@ -29,12 +29,7 @@ pub trait Store: Send + Sync + 'static {
     /// `false` if the lease was lost or the task no longer exists.
     fn heartbeat(&self, req: HeartbeatRequest) -> Result<bool>;
     fn add_trace_event(&self, req: TraceEventRequest) -> Result<TraceEventRecord>;
-    fn list_trace_events(
-        &self,
-        run_id: &str,
-        kind: &str,
-        task_id: &str,
-    ) -> Result<Vec<TraceEventRecord>>;
+    fn list_trace_events(&self, req: ListTraceEventsRequest) -> Result<Vec<TraceEventRecord>>;
     fn memo_get(&self, req: MemoGetRequest) -> Result<MemoGetResponse>;
     fn memo_put(&self, req: MemoPutRequest) -> Result<()>;
     fn summary(&self, req: SummaryRequest) -> Result<RunSummary>;

@@ -134,7 +134,7 @@ fn router(runtime: Runtime, token: Option<Arc<String>>) -> Router {
         .route("/variants/register", post(register_variants))
         .route("/variants/:run_id", get(list_variants))
         .route("/traces/events", post(add_trace_event))
-        .route("/traces/:run_id/:kind/:task_id", get(list_trace_events))
+        .route("/traces/list", post(list_trace_events))
         .route("/memos/get", post(memo_get))
         .route("/memos/put", post(memo_put))
         .layer(middleware::from_fn_with_state(token, require_token))
@@ -276,12 +276,9 @@ async fn add_trace_event(
 
 async fn list_trace_events(
     State(runtime): State<Runtime>,
-    Path((run_id, kind, task_id)): Path<(String, String, String)>,
+    Json(req): Json<ListTraceEventsRequest>,
 ) -> Result<Json<Vec<TraceEventRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime
-        .list_trace_events(&run_id, &kind, &task_id)
-        .map(Json)
-        .map_err(store_error)
+    runtime.list_trace_events(req).map(Json).map_err(store_error)
 }
 
 async fn memo_get(
