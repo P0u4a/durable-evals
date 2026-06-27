@@ -56,7 +56,6 @@ impl SqliteStore {
     pub fn begin(&self, req: BeginRequest) -> Result<Outcome> {
         let config_json = serde_json::to_string(&req.config)?;
         let dependencies_json = serde_json::to_string(&req.dependencies)?;
-        let variants_json = serde_json::to_string(&req.variants)?;
         let retry_json = serde_json::to_string(&req.retry)?;
         let worker_id = req.worker_id.clone();
         let lease_seconds = req.lease_seconds.unwrap_or(300);
@@ -138,11 +137,10 @@ impl SqliteStore {
                          attempt = ?4,
                          config_json = ?5,
                          dependencies_json = ?6,
-                         variants_json = ?7,
-                         retry_json = ?8,
-                         lease_owner = ?9,
+                         retry_json = ?7,
+                         lease_owner = ?8,
                          lease_acquired_at = datetime('now'),
-                         lease_expires_at = datetime('now', '+' || ?10 || ' seconds'),
+                         lease_expires_at = datetime('now', '+' || ?9 || ' seconds'),
                          heartbeat_at = datetime('now'),
                          retry_at = NULL,
                          started_at = COALESCE(started_at, datetime('now')),
@@ -155,7 +153,6 @@ impl SqliteStore {
                         next_attempt,
                         config_json,
                         dependencies_json,
-                        variants_json,
                         retry_json,
                         worker_id,
                         lease_seconds
@@ -173,11 +170,11 @@ impl SqliteStore {
                 tx.execute(
                     "INSERT INTO tasks
                      (run_id, kind, input_digest, status, attempt, config_json,
-                      dependencies_json, variants_json, retry_json, input_json, lease_owner,
+                      dependencies_json, retry_json, input_json, lease_owner,
                       lease_acquired_at, lease_expires_at, heartbeat_at, started_at,
                       created_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'running', 1, ?4, ?5, ?6, ?7, 'null', ?8,
-                             datetime('now'), datetime('now', '+' || ?9 || ' seconds'),
+                     VALUES (?1, ?2, ?3, 'running', 1, ?4, ?5, ?6, 'null', ?7,
+                             datetime('now'), datetime('now', '+' || ?8 || ' seconds'),
                              datetime('now'), datetime('now'), datetime('now'), datetime('now'))",
                     params![
                         req.run_id,
@@ -185,7 +182,6 @@ impl SqliteStore {
                         req.input_digest,
                         config_json,
                         dependencies_json,
-                        variants_json,
                         retry_json,
                         worker_id,
                         lease_seconds
@@ -205,26 +201,56 @@ impl SqliteStore {
              SET status = 'succeeded', output_json = ?4, error_json = NULL,
                  lease_owner = NULL, lease_expires_at = NULL, completed_at = datetime('now'),
                  updated_at = datetime('now')
-             WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
-            params![req.run_id, req.kind, req.input_digest, output_json],
+             WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3
+               AND status = 'running'
+               AND (?5 IS NULL OR attempt = ?5)
+               AND (?6 IS NULL OR lease_owner = ?6)",
+            params![
+                req.run_id,
+                req.kind,
+                req.input_digest,
+                output_json,
+                req.attempt,
+                req.worker_id
+            ],
         )?;
         if updated == 0 {
-            return Err(Error::TaskNotFound);
+            return if self.task_exists(&conn, &req.run_id, &req.kind, &req.input_digest)? {
+                Err(Error::TaskClaimLost)
+            } else {
+                Err(Error::TaskNotFound)
+            };
         }
         Ok(())
     }
 
     pub fn fail(&self, req: FailRequest) -> Result<()> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let (attempt, retry_json) = conn
+        let (attempt, retry_json, status, lease_owner) = conn
             .query_row(
-                "SELECT attempt, retry_json FROM tasks
+                "SELECT attempt, retry_json, status, lease_owner FROM tasks
                  WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
                 params![req.run_id, req.kind, req.input_digest],
-                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(Error::TaskNotFound)?;
+        if status != "running"
+            || req.attempt.is_some_and(|claimed| claimed != attempt)
+            || req
+                .worker_id
+                .as_ref()
+                .is_some_and(|claimed| lease_owner.as_ref() != Some(claimed))
+        {
+            return Err(Error::TaskClaimLost);
+        }
         let retry_policy: RetryPolicy = serde_json::from_str(&retry_json).unwrap_or_default();
 
         // Retryable failures stay `failed`; the attempt ceiling is enforced at the next
@@ -243,22 +269,30 @@ impl SqliteStore {
                 delay_ms.div_ceil(1000)
             })
             .filter(|secs| *secs > 0);
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE tasks
              SET status = ?4, error_json = ?5, lease_owner = NULL, lease_expires_at = NULL,
                  retry_at = CASE WHEN ?6 IS NULL THEN NULL
                                  ELSE datetime('now', '+' || ?6 || ' seconds') END,
                  completed_at = datetime('now'), updated_at = datetime('now')
-             WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
+             WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3
+               AND status = 'running'
+               AND (?7 IS NULL OR attempt = ?7)
+               AND (?8 IS NULL OR lease_owner = ?8)",
             params![
                 req.run_id,
                 req.kind,
                 req.input_digest,
                 status,
                 error_json,
-                delay_secs
+                delay_secs,
+                req.attempt,
+                req.worker_id
             ],
         )?;
+        if updated == 0 {
+            return Err(Error::TaskClaimLost);
+        }
         let failure_class = failure_class_to_str(&req.error.failure_class);
         conn.execute(
             "INSERT INTO failure_records
@@ -278,6 +312,23 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
+    }
+
+    fn task_exists(
+        &self,
+        conn: &Connection,
+        run_id: &str,
+        kind: &str,
+        input_digest: &str,
+    ) -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM tasks WHERE run_id = ?1 AND kind = ?2 AND input_digest = ?3",
+                params![run_id, kind, input_digest],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn register_dataset(&self, req: RegisterDatasetRequest) -> Result<DatasetSummary> {
@@ -369,49 +420,6 @@ impl SqliteStore {
         })
     }
 
-    pub fn register_variants(&self, req: RegisterVariantsRequest) -> Result<Vec<VariantRecord>> {
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM variants WHERE run_id = ?1 AND dimension = ?2",
-            params![req.run_id, req.dimension],
-        )?;
-        for variant in &req.variants {
-            tx.execute(
-                "INSERT INTO variants (run_id, dimension, name, config_json, digest)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    req.run_id,
-                    req.dimension,
-                    variant.name,
-                    serde_json::to_string(&variant.config)?,
-                    variant.digest
-                ],
-            )?;
-        }
-        tx.commit()?;
-        self.list_variants(&req.run_id)
-    }
-
-    pub fn list_variants(&self, run_id: &str) -> Result<Vec<VariantRecord>> {
-        let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT run_id, dimension, name, config_json, digest
-             FROM variants WHERE run_id = ?1 ORDER BY dimension, name",
-        )?;
-        let rows = stmt.query_map(params![run_id], |row| {
-            Ok(VariantRecord {
-                run_id: row.get(0)?,
-                dimension: row.get(1)?,
-                name: row.get(2)?,
-                config: parse_required(row.get::<_, String>(3)?)?,
-                digest: row.get(4)?,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::Sqlite)
-    }
-
     pub fn heartbeat(&self, req: HeartbeatRequest) -> Result<bool> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let updated = conn.execute(
@@ -471,10 +479,7 @@ impl SqliteStore {
         })
     }
 
-    pub fn list_trace_events(
-        &self,
-        req: ListTraceEventsRequest,
-    ) -> Result<Vec<TraceEventRecord>> {
+    pub fn list_trace_events(&self, req: ListTraceEventsRequest) -> Result<Vec<TraceEventRecord>> {
         let conn = self.conn.lock().expect("sqlite connection mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT id, run_id, kind, task_id, attempt, event_index, event_type,
@@ -645,7 +650,6 @@ impl SqliteStore {
                 attempt INTEGER NOT NULL,
                 config_json TEXT NOT NULL DEFAULT 'null',
                 dependencies_json TEXT NOT NULL DEFAULT '[]',
-                variants_json TEXT NOT NULL DEFAULT '{}',
                 retry_json TEXT NOT NULL DEFAULT '{}',
                 label TEXT,
                 category TEXT,
@@ -685,14 +689,6 @@ impl SqliteStore {
                 value_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (run_id, key_digest)
-            );
-            CREATE TABLE IF NOT EXISTS variants (
-                run_id TEXT NOT NULL,
-                dimension TEXT NOT NULL,
-                name TEXT NOT NULL,
-                config_json TEXT NOT NULL,
-                digest TEXT NOT NULL,
-                PRIMARY KEY (run_id, dimension, name)
             );
             CREATE TABLE IF NOT EXISTS trace_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -734,12 +730,6 @@ impl Store for SqliteStore {
     }
     fn list(&self, req: ListRequest) -> Result<Vec<TaskRecord>> {
         self.list(req)
-    }
-    fn register_variants(&self, req: RegisterVariantsRequest) -> Result<Vec<VariantRecord>> {
-        self.register_variants(req)
-    }
-    fn list_variants(&self, run_id: &str) -> Result<Vec<VariantRecord>> {
-        self.list_variants(run_id)
     }
     fn heartbeat(&self, req: HeartbeatRequest) -> Result<bool> {
         self.heartbeat(req)
@@ -869,7 +859,6 @@ mod tests {
             input_digest: "digest".to_string(),
             config: Value::Null,
             dependencies: vec![],
-            variants: BTreeMap::new(),
             retry: RetryPolicy::default(),
             worker_id: None,
             lease_seconds: None,
@@ -900,6 +889,50 @@ mod tests {
     }
 
     #[test]
+    fn stale_attempt_cannot_complete_newer_claim() {
+        let store = store();
+        let mut first = begin_req();
+        first.worker_id = Some("worker-a".to_string());
+        first.lease_seconds = Some(0);
+        assert!(matches!(
+            store.begin(first).expect("begin first"),
+            Outcome::Execute { attempt: 1 }
+        ));
+
+        let mut second = begin_req();
+        second.worker_id = Some("worker-b".to_string());
+        assert!(matches!(
+            store.begin(second).expect("begin second"),
+            Outcome::Execute { attempt: 2 }
+        ));
+
+        let stale = store.complete(CompleteRequest {
+            run_id: "run".to_string(),
+            kind: "step".to_string(),
+            input_digest: "digest".to_string(),
+            attempt: Some(1),
+            worker_id: Some("worker-a".to_string()),
+            output: json!({"stale": true}),
+        });
+        assert!(matches!(stale, Err(Error::TaskClaimLost)));
+
+        store
+            .complete(CompleteRequest {
+                run_id: "run".to_string(),
+                kind: "step".to_string(),
+                input_digest: "digest".to_string(),
+                attempt: Some(2),
+                worker_id: Some("worker-b".to_string()),
+                output: json!({"ok": true}),
+            })
+            .expect("complete active claim");
+        assert!(matches!(
+            store.begin(begin_req()).expect("begin completed"),
+            Outcome::SkipCompleted { output } if output == json!({"ok": true})
+        ));
+    }
+
+    #[test]
     fn failed_task_retries_on_next_begin() {
         let store = store();
         store.begin(begin_req()).expect("begin");
@@ -908,6 +941,8 @@ mod tests {
                 run_id: "run".to_string(),
                 kind: "step".to_string(),
                 input_digest: "digest".to_string(),
+                attempt: None,
+                worker_id: None,
                 error: transient_error(),
             })
             .expect("mark failed");
@@ -926,6 +961,8 @@ mod tests {
                 run_id: "run".to_string(),
                 kind: "step".to_string(),
                 input_digest: "digest".to_string(),
+                attempt: None,
+                worker_id: None,
                 output: json!({"ok": true}),
             })
             .expect("complete");
@@ -981,7 +1018,12 @@ mod tests {
         // No filters: every event for the run, grouped by kind/task/attempt/index.
         assert_eq!(
             trace_query(&store, None, None, None, vec![]),
-            vec!["scoring_event", "model_request", "tool_call", "model_request"]
+            vec![
+                "scoring_event",
+                "model_request",
+                "tool_call",
+                "model_request"
+            ]
         );
         // A specific task by id.
         assert_eq!(
@@ -1030,7 +1072,11 @@ mod tests {
             .expect("register dataset")
     }
 
-    fn list(store: &SqliteStore, statuses: Vec<String>, categories: Vec<String>) -> Vec<TaskRecord> {
+    fn list(
+        store: &SqliteStore,
+        statuses: Vec<String>,
+        categories: Vec<String>,
+    ) -> Vec<TaskRecord> {
         store
             .list(ListRequest {
                 run_id: "run".to_string(),
@@ -1057,10 +1103,24 @@ mod tests {
         let store = store();
         register(&store, vec![task("a", json!({"x": 1}))]);
         store
+            .begin(BeginRequest {
+                run_id: "run".to_string(),
+                kind: "dataset".to_string(),
+                input_digest: "a".to_string(),
+                config: Value::Null,
+                dependencies: vec![],
+                retry: RetryPolicy::default(),
+                worker_id: None,
+                lease_seconds: None,
+            })
+            .expect("begin task");
+        store
             .complete(CompleteRequest {
                 run_id: "run".to_string(),
                 kind: "dataset".to_string(),
                 input_digest: "a".to_string(),
+                attempt: None,
+                worker_id: None,
                 output: json!({"ok": true}),
             })
             .expect("complete task");
@@ -1109,7 +1169,6 @@ mod tests {
                     input_digest: "a".to_string(),
                     config: Value::Null,
                     dependencies: vec![],
-                    variants: BTreeMap::new(),
                     retry: RetryPolicy {
                         max_attempts: 2,
                         ..RetryPolicy::default()
@@ -1125,6 +1184,8 @@ mod tests {
                     run_id: "run".to_string(),
                     kind: "dataset".to_string(),
                     input_digest: "a".to_string(),
+                    attempt: None,
+                    worker_id: None,
                     error: transient_error(),
                 })
                 .expect("fail")
@@ -1158,6 +1219,8 @@ mod tests {
                 run_id: "run".to_string(),
                 kind: "step".to_string(),
                 input_digest: "digest".to_string(),
+                attempt: None,
+                worker_id: None,
                 error: transient_error(),
             })
             .expect("mark failed");

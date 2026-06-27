@@ -1,10 +1,7 @@
 use std::env;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use durable_evals_core::{Error as StoreError, *};
@@ -35,19 +32,12 @@ async fn main() -> anyhow::Result<()> {
 async fn serve_cmd() -> anyhow::Result<()> {
     let db = env::var("DURABLE_EVALS_DB").unwrap_or_else(|_| DEFAULT_DB.into());
     let runtime = build_runtime(&db)?;
-    // Optional shared-secret auth. Unset (the default) leaves the API open, which is fine
-    // for the loopback-bound local runtime but should be set whenever DURABLE_EVALS_ADDR
-    // exposes the server beyond localhost.
-    let token = env::var("DURABLE_EVALS_TOKEN")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(Arc::new);
     let addr: SocketAddr = env::var("DURABLE_EVALS_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:0".into())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("{}", listener.local_addr()?);
-    axum::serve(listener, router(runtime, token)).await?;
+    axum::serve(listener, router(runtime)).await?;
     Ok(())
 }
 
@@ -84,7 +74,7 @@ async fn run_cmd(args: Vec<String>) -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
     // The harness is a child process; the runtime lives for that child's lifetime.
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router(runtime, None)).await;
+        let _ = axum::serve(listener, router(runtime)).await;
     });
 
     let (program, mut cmd_args) = interpreter_for(&harness)?;
@@ -119,7 +109,7 @@ fn interpreter_for(harness: &str) -> anyhow::Result<(String, Vec<String>)> {
     }
 }
 
-fn router(runtime: Runtime, token: Option<Arc<String>>) -> Router {
+fn router(runtime: Runtime) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/runs/register", post(register_run))
@@ -131,13 +121,10 @@ fn router(runtime: Runtime, token: Option<Arc<String>>) -> Router {
         .route("/tasks/list", post(list))
         .route("/tasks/heartbeat", post(heartbeat))
         .route("/datasets/register", post(register_dataset))
-        .route("/variants/register", post(register_variants))
-        .route("/variants/:run_id", get(list_variants))
         .route("/traces/events", post(add_trace_event))
         .route("/traces/list", post(list_trace_events))
         .route("/memos/get", post(memo_get))
         .route("/memos/put", post(memo_put))
-        .layer(middleware::from_fn_with_state(token, require_token))
         .with_state(runtime)
 }
 
@@ -148,38 +135,6 @@ fn build_runtime(db: &str) -> anyhow::Result<Runtime> {
         }
     }
     Ok(Runtime::new(SqliteStore::open(db)?))
-}
-
-/// Reject requests without a matching `Authorization: Bearer <token>` when a token is
-/// configured. `/health` stays open so liveness probes don't need the secret.
-async fn require_token(
-    State(token): State<Option<Arc<String>>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    if let Some(expected) = token.as_deref() {
-        if req.uri().path() != "/health" {
-            let provided = req
-                .headers()
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "));
-            if provided != Some(expected.as_str()) {
-                return (
-                    axum::http::StatusCode::UNAUTHORIZED,
-                    Json(ErrorInfo {
-                        error_type: "Unauthorized".to_string(),
-                        message: "missing or invalid bearer token".to_string(),
-                        failure_class: FailureClass::DurableHarnessError,
-                        stack: None,
-                        retryable: Some(false),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    }
-    next.run(req).await
 }
 
 async fn health() -> Json<Health> {
@@ -247,26 +202,6 @@ async fn list(
     runtime.list(req).map(Json).map_err(store_error)
 }
 
-async fn register_variants(
-    State(runtime): State<Runtime>,
-    Json(req): Json<RegisterVariantsRequest>,
-) -> Result<Json<Vec<VariantRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime
-        .register_variants(req)
-        .map(Json)
-        .map_err(store_error)
-}
-
-async fn list_variants(
-    State(runtime): State<Runtime>,
-    Path(run_id): Path<String>,
-) -> Result<Json<Vec<VariantRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime
-        .list_variants(&run_id)
-        .map(Json)
-        .map_err(store_error)
-}
-
 async fn add_trace_event(
     State(runtime): State<Runtime>,
     Json(req): Json<TraceEventRequest>,
@@ -278,7 +213,10 @@ async fn list_trace_events(
     State(runtime): State<Runtime>,
     Json(req): Json<ListTraceEventsRequest>,
 ) -> Result<Json<Vec<TraceEventRecord>>, (axum::http::StatusCode, Json<ErrorInfo>)> {
-    runtime.list_trace_events(req).map(Json).map_err(store_error)
+    runtime
+        .list_trace_events(req)
+        .map(Json)
+        .map_err(store_error)
 }
 
 async fn memo_get(
@@ -315,6 +253,7 @@ async fn export_run(
 fn store_error(error: StoreError) -> (axum::http::StatusCode, Json<ErrorInfo>) {
     let (status, error_type) = match error {
         StoreError::TaskNotFound => (axum::http::StatusCode::NOT_FOUND, "TaskNotFound"),
+        StoreError::TaskClaimLost => (axum::http::StatusCode::CONFLICT, "TaskClaimLost"),
         _ => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "InternalServerError",

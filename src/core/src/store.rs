@@ -10,6 +10,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("task not found")]
     TaskNotFound,
+    #[error("task claim no longer active")]
+    TaskClaimLost,
 }
 
 /// Backend-agnostic durable store, implemented by [`crate::SqliteStore`]. Every unit of
@@ -23,8 +25,6 @@ pub trait Store: Send + Sync + 'static {
     fn complete(&self, req: CompleteRequest) -> Result<()>;
     fn fail(&self, req: FailRequest) -> Result<()>;
     fn list(&self, req: ListRequest) -> Result<Vec<TaskRecord>>;
-    fn register_variants(&self, req: RegisterVariantsRequest) -> Result<Vec<VariantRecord>>;
-    fn list_variants(&self, run_id: &str) -> Result<Vec<VariantRecord>>;
     /// Returns `true` if the heartbeat refreshed a lease still owned by the worker,
     /// `false` if the lease was lost or the task no longer exists.
     fn heartbeat(&self, req: HeartbeatRequest) -> Result<bool>;

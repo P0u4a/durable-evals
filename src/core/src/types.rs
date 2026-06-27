@@ -20,8 +20,6 @@ pub struct BeginRequest {
     #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
-    pub variants: BTreeMap<String, String>,
-    #[serde(default)]
     pub retry: RetryPolicy,
     #[serde(default)]
     pub worker_id: Option<String>,
@@ -35,6 +33,10 @@ pub struct CompleteRequest {
     pub kind: String,
     pub input_digest: String,
     #[serde(default)]
+    pub attempt: Option<u32>,
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    #[serde(default)]
     pub output: Value,
 }
 
@@ -43,6 +45,10 @@ pub struct FailRequest {
     pub run_id: String,
     pub kind: String,
     pub input_digest: String,
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    #[serde(default)]
+    pub worker_id: Option<String>,
     pub error: ErrorInfo,
 }
 
@@ -214,30 +220,6 @@ pub struct ErrorInfo {
     pub stack: Option<String>,
     #[serde(default)]
     pub retryable: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterVariantsRequest {
-    pub run_id: String,
-    pub dimension: String,
-    pub variants: Vec<VariantInput>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VariantInput {
-    pub name: String,
-    #[serde(default)]
-    pub config: Value,
-    pub digest: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VariantRecord {
-    pub run_id: String,
-    pub dimension: String,
-    pub name: String,
-    pub config: Value,
-    pub digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

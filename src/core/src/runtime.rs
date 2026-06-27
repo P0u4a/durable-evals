@@ -39,17 +39,6 @@ impl Runtime {
         self.store.list(req)
     }
 
-    pub fn register_variants(
-        &self,
-        req: RegisterVariantsRequest,
-    ) -> Result<Vec<VariantRecord>> {
-        self.store.register_variants(req)
-    }
-
-    pub fn list_variants(&self, run_id: &str) -> Result<Vec<VariantRecord>> {
-        self.store.list_variants(run_id)
-    }
-
     pub fn heartbeat(&self, req: HeartbeatRequest) -> Result<bool> {
         self.store.heartbeat(req)
     }
@@ -58,10 +47,7 @@ impl Runtime {
         self.store.add_trace_event(req)
     }
 
-    pub fn list_trace_events(
-        &self,
-        req: ListTraceEventsRequest,
-    ) -> Result<Vec<TraceEventRecord>> {
+    pub fn list_trace_events(&self, req: ListTraceEventsRequest) -> Result<Vec<TraceEventRecord>> {
         self.store.list_trace_events(req)
     }
 
