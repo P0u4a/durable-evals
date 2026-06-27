@@ -154,9 +154,8 @@ console.log(await evalRun.summary());
 Memoize individual model calls for sub-task recovery:
 
 ```ts
-const response = await evalRun.memo(
-  { task, turn, messages },
-  () => callModel(messages),
+const response = await evalRun.memo({ task, turn, messages }, () =>
+  callModel(messages),
 );
 ```
 
@@ -191,8 +190,8 @@ Read traces back. `listTraces` returns every trace event for the run by default.
 `eventType` (a single type or a list), and `attempt`:
 
 ```ts
-const allEvents = await evalRun.listTraces();              // every event for the run
-const taskEvents = await evalRun.listTraces({ task });     // one task by id
+const allEvents = await evalRun.listTraces(); // every event for the run
+const taskEvents = await evalRun.listTraces({ task }); // one task by id
 const modelCalls = await evalRun.listTraces({
   kind: "browserTasks",
   eventType: ["model_request", "model_response"],
@@ -211,13 +210,3 @@ Useful environment variables:
 - `DURABLE_EVALS_SERVER_BIN`: Override the `durable-eval` binary path used for auto-spawn.
 - `DURABLE_EVALS_DB`: Set the SQLite database path for the server.
 - `DURABLE_EVALS_ADDR`: Set the server bind address.
-- `DURABLE_EVALS_TOKEN`: Require `Authorization: Bearer <token>` on every
-  request except `/health`. Clients read the same variable and attach the
-  header automatically.
-
-### Security
-
-The server has no authentication by default and binds to `127.0.0.1:0`, so it is
-only reachable locally. If you point `DURABLE_EVALS_ADDR` at a non-loopback
-address, also set `DURABLE_EVALS_TOKEN` (and front it with TLS) — otherwise the
-mutating API is exposed unauthenticated.
