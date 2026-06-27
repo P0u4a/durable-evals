@@ -22,9 +22,10 @@ class Runtime implements DurableRuntime {
   completed: Payload[] = [];
   failed: Payload[] = [];
   tasks = new Map<string, Payload[]>();
+  attempts = new Map<string, number>();
+  errors = new Map<string, Payload>();
   memos = new Map<string, unknown>();
   memoPuts: Payload[] = [];
-  variantsPayload: Payload | null = null;
   traceEvents: Payload[] = [];
   completeError: Error | null = null;
 
@@ -46,6 +47,8 @@ class Runtime implements DurableRuntime {
       return this.outcome;
     }
     const record = this.recordFor(payload);
+    const retry = (payload.retry ?? {}) as { max_attempts?: number };
+    const maxAttempts = retry.max_attempts ?? 2;
     if (record && record.status === "succeeded") {
       return { type: "skip_completed", output: record.output };
     }
@@ -55,7 +58,28 @@ class Runtime implements DurableRuntime {
         error: { error_type: "Terminal", message: "terminal" },
       };
     }
-    return { type: "execute", attempt: 1 };
+    const key = `${payload.run_id}:${payload.kind}:${payload.input_digest}`;
+    const attempt = Number(record?.attempt ?? this.attempts.get(key) ?? 0);
+    if (attempt >= maxAttempts) {
+      if (record) {
+        record.status = "terminal";
+      }
+      const error = this.errors.get(key);
+      return {
+        type: "failed_terminal",
+        error: {
+          error_type: String(error?.error_type ?? "MaxAttemptsExceeded"),
+          message: String(error?.message ?? "terminal"),
+        },
+      };
+    }
+    const nextAttempt = attempt + 1;
+    if (record) {
+      record.status = "running";
+      record.attempt = nextAttempt;
+    }
+    this.attempts.set(key, nextAttempt);
+    return { type: "execute", attempt: nextAttempt };
   }
 
   async complete(payload: Payload): Promise<void> {
@@ -72,6 +96,10 @@ class Runtime implements DurableRuntime {
 
   async fail(payload: Payload): Promise<void> {
     this.failed.push(payload);
+    this.errors.set(
+      `${payload.run_id}:${payload.kind}:${payload.input_digest}`,
+      payload.error as Payload,
+    );
     const record = this.recordFor(payload);
     if (record) {
       record.status = "failed";
@@ -121,11 +149,6 @@ class Runtime implements DurableRuntime {
     this.memoPuts.push(payload);
     this.memos.set(`${payload.run_id}:${payload.key_digest}`, payload.value);
     return { ok: true };
-  }
-
-  async registerVariants(payload: Payload): Promise<Payload[]> {
-    this.variantsPayload = payload;
-    return payload.variants as Payload[];
   }
 
   async traceEvent(payload: Payload): Promise<Payload> {
@@ -223,8 +246,8 @@ test("records callback failures", async () => {
   });
 
   await assert.rejects(explode(), /boom/);
-  assert.equal(runtime.failed.length, 1);
-  assert.deepEqual(runtime.failed[0].error, {
+  assert.equal(runtime.failed.length, 2);
+  assert.deepEqual(runtime.failed.at(-1)?.error, {
     error_type: "TypeError",
     message: "boom",
     failure_class: "eval_exception",
@@ -540,16 +563,12 @@ test("listTraces rejects task and taskId together", async () => {
   );
 });
 
-test("variants trace summary and export helpers call runtime", async () => {
+test("trace summary and export helpers call runtime", async () => {
   const runtime = new Runtime();
   const evalRun = new DurableEval({ runId: "run", runtime });
 
-  const variants = await evalRun.variants("model", [
-    { name: "a", config: { model: "a" } },
-  ]);
   await evalRun.traceTask("tasks", { taskId: "task" }).modelRequest({ messages: [] });
 
-  assert.equal(variants[0].name, "a");
   assert.equal(runtime.traceEvents[0].event_type, "model_request");
   assert.deepEqual(await evalRun.summary(), { run_id: "run" });
   assert.equal(await evalRun.export(), "exported");

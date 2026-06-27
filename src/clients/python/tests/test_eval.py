@@ -12,7 +12,6 @@ class Runtime:
         self.tasks = {}
         self.completed = []
         self.failed = []
-        self.variants_payload = None
         self.trace_events = []
         self.memos = {}
 
@@ -50,8 +49,12 @@ class Runtime:
 
     def begin(self, payload):
         record = self._record(payload)
+        max_attempts = payload.get("retry", {}).get("max_attempts", 2)
         # New/unknown tasks (e.g. steps that were never registered) execute too.
         if record is None or record["status"] in ("pending", "running", "failed"):
+            if record is not None and record.get("attempt", 0) >= max_attempts:
+                record["status"] = "terminal"
+                return {"type": "failed_terminal", "error": record["error"]}
             if record is not None:
                 record["status"] = "running"
                 record["attempt"] = record.get("attempt", 0) + 1
@@ -116,10 +119,6 @@ class Runtime:
 
     async def amemo_put(self, payload):
         return self.memo_put(payload)
-
-    def register_variants(self, payload):
-        self.variants_payload = payload
-        return payload["variants"]
 
     def trace_event(self, payload):
         record = {**payload, "event_index": len(self.trace_events)}
@@ -384,15 +383,13 @@ def test_alist_traces_filters_by_event_type():
     assert [event["event_type"] for event in events] == ["tool_call"]
 
 
-def test_variants_trace_and_export_helpers_are_thin_runtime_calls():
+def test_trace_and_export_helpers_are_thin_runtime_calls():
     runtime = Runtime()
     eval_run = DurableEval(run_id="run", runtime=runtime)
 
-    variants = eval_run.variants("model", [{"name": "a", "config": {"model": "a"}}])
     with eval_run.trace_task("tasks", task_id="task") as trace:
         trace.model_request({"messages": []})
 
-    assert variants[0]["name"] == "a"
     assert runtime.trace_events[0]["event_type"] == "model_request"
     assert eval_run.summary() == {"run_id": "run"}
     assert eval_run.export() == "exported"

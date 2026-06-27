@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as _datetime
 import hashlib
 import inspect
 import json
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import AbstractContextManager
@@ -40,6 +42,7 @@ class DurableEval:
         self.run_id = run_id or str(uuid.uuid4())
         self.name = name
         self.config = config or {}
+        self.worker_id = str(uuid.uuid4())
         self._runtime = runtime or RuntimeClient.ensure_started(Path(storage_dir))
         if hasattr(self._runtime, "register_run"):
             self._runtime.register_run(
@@ -51,21 +54,6 @@ class DurableEval:
         if kwargs:
             return dataset.map(**kwargs)
         return dataset
-
-    def variants(self, dimension: str, variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        payload = []
-        for variant in variants:
-            config = variant.get("config", {})
-            payload.append(
-                {
-                    "name": variant["name"],
-                    "config": config,
-                    "digest": variant.get("digest") or _json_digest(config),
-                }
-            )
-        return self._runtime.register_variants(
-            {"run_id": self.run_id, "dimension": dimension, "variants": payload}
-        )
 
     def trace_task(
         self,
@@ -226,49 +214,60 @@ class Dataset:
 
         async def run_one(indexes: list[int], task: Any, digest: str) -> None:
             async with semaphore:
-                outcome = await self.eval._runtime.abegin(
-                    {
-                        "run_id": self.eval.run_id,
-                        "kind": self.dataset_name,
-                        "input_digest": digest,
-                        "retry": retry,
-                    }
-                )
-                kind = outcome["type"]
-                if kind == "skip_completed":
-                    for index in indexes:
-                        outputs[index] = outcome["output"]
-                    return
-                if kind != "execute":
-                    # in_progress / retry_later / failed_terminal: leave positions None.
-                    return
-                try:
-                    result = run(task)
-                    if inspect.isawaitable(result):
-                        result = await result
-                except Exception as exc:
-                    # Record and move on so one bad task doesn't cancel the dataset.
-                    await self.eval._runtime.afail(
+                while True:
+                    outcome = await self.eval._runtime.abegin(
                         {
                             "run_id": self.eval.run_id,
                             "kind": self.dataset_name,
                             "input_digest": digest,
-                            "error": _error_payload(exc),
+                            "retry": retry,
+                            "worker_id": self.eval.worker_id,
                         }
                     )
+                    kind = outcome["type"]
+                    if kind == "skip_completed":
+                        for index in indexes:
+                            outputs[index] = outcome["output"]
+                        return
+                    if kind == "retry_later":
+                        await _asleep_until(outcome["retry_at"])
+                        continue
+                    if kind != "execute":
+                        # in_progress / failed_terminal: leave positions None.
+                        return
+                    attempt = outcome["attempt"]
+                    try:
+                        result = run(task)
+                        if inspect.isawaitable(result):
+                            result = await result
+                    except Exception as exc:
+                        # Record and retry according to the stored retry policy.
+                        await self.eval._runtime.afail(
+                            {
+                                "run_id": self.eval.run_id,
+                                "kind": self.dataset_name,
+                                "input_digest": digest,
+                                "attempt": attempt,
+                                "worker_id": self.eval.worker_id,
+                                "error": _error_payload(exc),
+                            }
+                        )
+                        continue
+                    await self.eval._runtime.acomplete(
+                        {
+                            "run_id": self.eval.run_id,
+                            "kind": self.dataset_name,
+                            "input_digest": digest,
+                            "attempt": attempt,
+                            "worker_id": self.eval.worker_id,
+                            "output": result,
+                        }
+                    )
+                    for index in indexes:
+                        outputs[index] = result
+                    if progress:
+                        progress(await self._asummary())
                     return
-                await self.eval._runtime.acomplete(
-                    {
-                        "run_id": self.eval.run_id,
-                        "kind": self.dataset_name,
-                        "input_digest": digest,
-                        "output": result,
-                    }
-                )
-                for index in indexes:
-                    outputs[index] = result
-                if progress:
-                    progress(await self._asummary())
 
         tasks = [
             asyncio.create_task(run_one(indexes, self.tasks[indexes[0]], digest))
@@ -386,51 +385,62 @@ class Dataset:
         retry: dict[str, Any],
     ) -> None:
         indexes, task, digest = item
-        outcome = self.eval._runtime.begin(
-            {
-                "run_id": self.eval.run_id,
-                "kind": self.dataset_name,
-                "input_digest": digest,
-                "retry": retry,
-            }
-        )
-        kind = outcome["type"]
-        if kind == "skip_completed":
-            for index in indexes:
-                outputs[index] = outcome["output"]
-            return
-        if kind != "execute":
-            # in_progress / retry_later / failed_terminal: leave positions None.
-            return
-        try:
-            result = run(task)
-        except Exception as exc:
-            # Record and move on so one bad task doesn't abort the dataset.
-            self.eval._runtime.fail(
+        while True:
+            outcome = self.eval._runtime.begin(
                 {
                     "run_id": self.eval.run_id,
                     "kind": self.dataset_name,
                     "input_digest": digest,
-                    "error": _error_payload(exc),
+                    "retry": retry,
+                    "worker_id": self.eval.worker_id,
                 }
             )
+            kind = outcome["type"]
+            if kind == "skip_completed":
+                for index in indexes:
+                    outputs[index] = outcome["output"]
+                return
+            if kind == "retry_later":
+                _sleep_until(outcome["retry_at"])
+                continue
+            if kind != "execute":
+                # in_progress / failed_terminal: leave positions None.
+                return
+            attempt = outcome["attempt"]
+            try:
+                result = run(task)
+            except Exception as exc:
+                # Record and retry according to the stored retry policy.
+                self.eval._runtime.fail(
+                    {
+                        "run_id": self.eval.run_id,
+                        "kind": self.dataset_name,
+                        "input_digest": digest,
+                        "attempt": attempt,
+                        "worker_id": self.eval.worker_id,
+                        "error": _error_payload(exc),
+                    }
+                )
+                continue
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise TypeError("sync dataset callback returned an awaitable")
+            self.eval._runtime.complete(
+                {
+                    "run_id": self.eval.run_id,
+                    "kind": self.dataset_name,
+                    "input_digest": digest,
+                    "attempt": attempt,
+                    "worker_id": self.eval.worker_id,
+                    "output": result,
+                }
+            )
+            for index in indexes:
+                outputs[index] = result
+            if progress:
+                progress(self.summary())
             return
-        if inspect.isawaitable(result):
-            if inspect.iscoroutine(result):
-                result.close()
-            raise TypeError("sync dataset callback returned an awaitable")
-        self.eval._runtime.complete(
-            {
-                "run_id": self.eval.run_id,
-                "kind": self.dataset_name,
-                "input_digest": digest,
-                "output": result,
-            }
-        )
-        for index in indexes:
-            outputs[index] = result
-        if progress:
-            progress(self.summary())
 
 
 class TraceTask(AbstractContextManager["TraceTask"]):
@@ -491,3 +501,26 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
         "failure_class": "eval_exception",
         "retryable": True,
     }
+
+
+def _retry_delay_seconds(retry_at: str) -> float:
+    try:
+        dt = _datetime.datetime.strptime(retry_at, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=_datetime.timezone.utc
+        )
+    except ValueError:
+        return 0.0
+    now = _datetime.datetime.now(_datetime.timezone.utc)
+    return max(0.0, (dt - now).total_seconds())
+
+
+def _sleep_until(retry_at: str) -> None:
+    delay = _retry_delay_seconds(retry_at)
+    if delay > 0:
+        time.sleep(delay)
+
+
+async def _asleep_until(retry_at: str) -> None:
+    delay = _retry_delay_seconds(retry_at)
+    if delay > 0:
+        await asyncio.sleep(delay)

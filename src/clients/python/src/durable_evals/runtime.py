@@ -15,8 +15,6 @@ class RuntimeClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
         self._async_client: httpx.AsyncClient | None = None
-        token = os.environ.get("DURABLE_EVALS_TOKEN")
-        self._headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     @classmethod
     def ensure_started(cls, storage_dir: Path) -> "RuntimeClient":
@@ -78,9 +76,7 @@ class RuntimeClient:
 
     def is_healthy(self) -> bool:
         try:
-            response = httpx.get(
-                f"{self.base_url}/health", headers=self._headers, timeout=0.2
-            )
+            response = httpx.get(f"{self.base_url}/health", timeout=0.2)
             return response.status_code == 200 and response.json().get("ok") is True
         except httpx.HTTPError:
             return False
@@ -121,9 +117,6 @@ class RuntimeClient:
 
     def register_dataset(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/datasets/register", payload)
-
-    def register_variants(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        return self._post("/variants/register", payload)
 
     def trace_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post("/traces/events", payload)
@@ -168,7 +161,7 @@ class RuntimeClient:
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = httpx.post(
-            f"{self.base_url}{path}", json=payload, headers=self._headers, timeout=30
+            f"{self.base_url}{path}", json=payload, timeout=30
         )
         _raise_for_status(response)
         return response.json()
@@ -180,9 +173,7 @@ class RuntimeClient:
 
     def _async_http(self) -> httpx.AsyncClient:
         if self._async_client is None or self._async_client.is_closed:
-            self._async_client = httpx.AsyncClient(
-                base_url=self.base_url, headers=self._headers, timeout=30
-            )
+            self._async_client = httpx.AsyncClient(base_url=self.base_url, timeout=30)
         return self._async_client
 
     async def aclose(self) -> None:

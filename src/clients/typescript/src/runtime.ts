@@ -23,7 +23,6 @@ export interface Runtime {
   registerDataset?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
   memoGet?(payload: Record<string, unknown>): Promise<{ found: boolean; value: unknown }>;
   memoPut?(payload: Record<string, unknown>): Promise<{ ok: boolean }>;
-  registerVariants?(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
   traceEvent?(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
   listTraceEvents?(
     payload: Record<string, unknown>,
@@ -32,12 +31,9 @@ export interface Runtime {
 
 export class RuntimeClient implements Runtime {
   readonly baseUrl: string;
-  private readonly headers: Record<string, string>;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
-    const token = process.env.DURABLE_EVALS_TOKEN;
-    this.headers = token ? { authorization: `Bearer ${token}` } : {};
   }
 
   static async ensureStarted(storageDir = ".durable"): Promise<RuntimeClient> {
@@ -111,7 +107,6 @@ export class RuntimeClient implements Runtime {
   async isHealthy(): Promise<boolean> {
     try {
       const response = await fetch(`${this.baseUrl}/health`, {
-        headers: this.headers,
         signal: AbortSignal.timeout(200),
       });
       const body = (await response.json()) as { ok?: unknown };
@@ -176,10 +171,6 @@ export class RuntimeClient implements Runtime {
     return (await this.post("/memos/put", payload)) as { ok: boolean };
   }
 
-  async registerVariants(payload: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
-    return (await this.post("/variants/register", payload)) as Array<Record<string, unknown>>;
-  }
-
   async traceEvent(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
     return (await this.post("/traces/events", payload)) as Record<string, unknown>;
   }
@@ -198,7 +189,7 @@ export class RuntimeClient implements Runtime {
   ): Promise<unknown> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json", ...this.headers },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(30000),
     });

@@ -64,17 +64,9 @@ Callback failures are recorded as workload failures. Serialization, storage, and
 completion failures are raised to the caller and are not recorded as task or step
 failures.
 
-## Variants, Traces, And Reports
+## Traces And Reports
 
 ```python
-eval_run.variants(
-    "prompt",
-    [
-        {"name": "baseline", "config": {"prompt": "v1"}},
-        {"name": "candidate", "config": {"prompt": "v2"}},
-    ],
-)
-
 with eval_run.trace_task("agent_tasks", task=task) as trace:
     trace.model_request({"messages": []})
     trace.model_response({"content": "ok"})

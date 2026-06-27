@@ -23,6 +23,7 @@ export class DurableEval {
   readonly name?: string;
   readonly config: Record<string, unknown>;
   private readonly storageDir: string;
+  private readonly workerId: string;
   private runtime: Runtime | Promise<Runtime> | null;
   private runRegistered = false;
 
@@ -31,6 +32,7 @@ export class DurableEval {
     this.name = options.name;
     this.config = options.config ?? {};
     this.storageDir = options.storageDir ?? ".durable";
+    this.workerId = randomUUID();
     this.runtime = options.runtime ?? null;
   }
 
@@ -65,26 +67,6 @@ export class DurableEval {
     options: { category?: (task: TTask) => string } = {},
   ): Dataset<TTask> {
     return new Dataset(this, datasetName, tasks, options.category);
-  }
-
-  async variants(
-    dimension: string,
-    variants: Array<{ name: string; config?: Record<string, unknown>; digest?: string }>,
-  ): Promise<Array<Record<string, unknown>>> {
-    const runtime = await this.getRuntime();
-    assertRuntimeMethod(runtime.registerVariants, "registerVariants");
-    return await runtime.registerVariants({
-      run_id: this.runId,
-      dimension,
-      variants: variants.map((variant) => {
-        const config = variant.config ?? {};
-        return {
-          name: variant.name,
-          config,
-          digest: variant.digest ?? digestJson(config),
-        };
-      }),
-    });
   }
 
   traceTask(
@@ -173,56 +155,59 @@ export class DurableEval {
   ): Promise<Awaited<TOutput>> {
     const runtime = await this.getRuntime();
     const inputDigest = inputDigestFor(stepName, args);
-    const outcome = await runtime.begin({
-      run_id: this.runId,
-      kind: stepName,
-      input_digest: inputDigest,
-      retry: options.retry ?? {},
-    });
-
-    if (outcome.type === "skip_completed") {
-      return outcome.output as Awaited<TOutput>;
-    }
-    if (outcome.type === "failed_terminal") {
-      const error = outcome.error;
-      throw new DurableStepFailed(`${error.error_type}: ${error.message}`);
-    }
-    if (outcome.type === "in_progress") {
-      throw new DurableStepInProgress(`step is already running: ${stepName}`);
-    }
-    if (outcome.type === "retry_later") {
-      throw new DurableStepInProgress(`step retry is scheduled at ${outcome.retry_at}: ${stepName}`);
-    }
-    if (outcome.type !== "execute") {
-      throw new Error(`unexpected step outcome: ${(outcome as { type?: string }).type}`);
-    }
-
-    let result: TOutput;
-    try {
-      result = await callback(...args);
-    } catch (error) {
-      await runtime.fail({
+    for (;;) {
+      const outcome = await runtime.begin({
         run_id: this.runId,
         kind: stepName,
         input_digest: inputDigest,
-        error: {
-          error_type: error instanceof Error ? error.name : "Error",
-          message: error instanceof Error ? error.message : String(error),
-          failure_class: "eval_exception",
-          retryable: true,
-        },
+        retry: options.retry ?? {},
+        worker_id: this.workerId,
       });
-      throw error;
-    }
 
-    assertJsonSerializable(result, `step output for ${stepName}`);
-    await runtime.complete({
-      run_id: this.runId,
-      kind: stepName,
-      input_digest: inputDigest,
-      output: result,
-    });
-    return result as Awaited<TOutput>;
+      if (outcome.type === "skip_completed") {
+        return outcome.output as Awaited<TOutput>;
+      }
+      if (outcome.type === "failed_terminal") {
+        const error = outcome.error;
+        throw new DurableStepFailed(`${error.error_type}: ${error.message}`);
+      }
+      if (outcome.type === "in_progress") {
+        throw new DurableStepInProgress(`step is already running: ${stepName}`);
+      }
+      if (outcome.type === "retry_later") {
+        await sleepUntil(outcome.retry_at);
+        continue;
+      }
+      if (outcome.type !== "execute") {
+        throw new Error(`unexpected step outcome: ${(outcome as { type?: string }).type}`);
+      }
+
+      let result: TOutput;
+      try {
+        result = await callback(...args);
+      } catch (error) {
+        await runtime.fail({
+          run_id: this.runId,
+          kind: stepName,
+          input_digest: inputDigest,
+          attempt: outcome.attempt,
+          worker_id: this.workerId,
+          error: errorPayload(error),
+        });
+        continue;
+      }
+
+      assertJsonSerializable(result, `step output for ${stepName}`);
+      await runtime.complete({
+        run_id: this.runId,
+        kind: stepName,
+        input_digest: inputDigest,
+        attempt: outcome.attempt,
+        worker_id: this.workerId,
+        output: result,
+      });
+      return result as Awaited<TOutput>;
+    }
   }
 
   private async getRuntime(): Promise<Runtime> {
@@ -299,47 +284,58 @@ export class Dataset<TTask> {
       while (cursor < runnable.length) {
         const { digest, positions } = runnable[cursor++];
         const task = this.tasks[positions[0]];
-        const outcome = await runtime.begin({
-          run_id: this.evalRun.runId,
-          kind: this.datasetName,
-          input_digest: digest,
-          retry,
-        });
-
-        if (outcome.type === "skip_completed") {
-          for (const position of positions) {
-            outputs[position] = outcome.output as TOutput;
-          }
-          options.progress?.(await this.summary());
-          continue;
-        }
-        // in_progress / retry_later / failed_terminal: leave positions empty.
-        if (outcome.type !== "execute") {
-          continue;
-        }
-
-        try {
-          const output = await options.run(task);
-          assertJsonSerializable(output, `dataset output for ${this.datasetName}`);
-          await runtime.complete({
+        for (;;) {
+          const outcome = await runtime.begin({
             run_id: this.evalRun.runId,
             kind: this.datasetName,
             input_digest: digest,
-            output,
+            retry,
+            worker_id: this.workerId(),
           });
-          for (const position of positions) {
-            outputs[position] = output;
+
+          if (outcome.type === "skip_completed") {
+            for (const position of positions) {
+              outputs[position] = outcome.output as TOutput;
+            }
+            options.progress?.(await this.summary());
+            break;
           }
-          options.progress?.(await this.summary());
-        } catch (error) {
-          // Record the failure durably and keep going; aborting here would cancel
-          // sibling tasks that are still running. Positions are left empty.
-          await runtime.fail({
-            run_id: this.evalRun.runId,
-            kind: this.datasetName,
-            input_digest: digest,
-            error: errorPayload(error),
-          });
+          if (outcome.type === "retry_later") {
+            await sleepUntil(outcome.retry_at);
+            continue;
+          }
+          // in_progress / failed_terminal: leave positions empty.
+          if (outcome.type !== "execute") {
+            break;
+          }
+
+          try {
+            const output = await options.run(task);
+            assertJsonSerializable(output, `dataset output for ${this.datasetName}`);
+            await runtime.complete({
+              run_id: this.evalRun.runId,
+              kind: this.datasetName,
+              input_digest: digest,
+              attempt: outcome.attempt,
+              worker_id: this.workerId(),
+              output,
+            });
+            for (const position of positions) {
+              outputs[position] = output;
+            }
+            options.progress?.(await this.summary());
+            break;
+          } catch (error) {
+            // Record the failure durably and retry according to the stored retry policy.
+            await runtime.fail({
+              run_id: this.evalRun.runId,
+              kind: this.datasetName,
+              input_digest: digest,
+              attempt: outcome.attempt,
+              worker_id: this.workerId(),
+              error: errorPayload(error),
+            });
+          }
         }
       }
     };
@@ -421,6 +417,10 @@ export class Dataset<TTask> {
     assertRuntimeMethod(runtime.registerDataset, "registerDataset");
     assertRuntimeMethod(runtime.list, "list");
     return runtime;
+  }
+
+  private workerId(): string {
+    return (this.evalRun as unknown as { workerId: string }).workerId;
   }
 }
 
@@ -546,4 +546,15 @@ function errorPayload(error: unknown): Record<string, unknown> {
     failure_class: "eval_exception",
     retryable: true,
   };
+}
+
+async function sleepUntil(retryAt: string): Promise<void> {
+  const retryTime = Date.parse(`${retryAt.replace(" ", "T")}Z`);
+  if (!Number.isFinite(retryTime)) {
+    return;
+  }
+  const delay = retryTime - Date.now();
+  if (delay > 0) {
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
 }

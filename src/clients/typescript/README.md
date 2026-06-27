@@ -55,14 +55,9 @@ Callback failures are recorded as workload failures. Serialization, storage, and
 completion failures are raised to the caller and are not recorded as task or step
 failures.
 
-## Variants, Traces, And Reports
+## Traces And Reports
 
 ```ts
-await evalRun.variants("prompt", [
-  { name: "baseline", config: { prompt: "v1" } },
-  { name: "candidate", config: { prompt: "v2" } },
-]);
-
 const trace = evalRun.traceTask("agentTasks", { task });
 await trace.modelRequest({ messages: [] });
 await trace.modelResponse({ content: "ok" });
