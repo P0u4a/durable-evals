@@ -933,6 +933,62 @@ mod tests {
     }
 
     #[test]
+    fn eval_exception_is_terminal_by_default() {
+        // A plain user exception (no explicit `retryable`) is not in the default retry
+        // policy, so the runtime marks it terminal instead of burning further attempts.
+        let store = store();
+        store.begin(begin_req()).expect("begin");
+        store
+            .fail(FailRequest {
+                run_id: "run".to_string(),
+                kind: "step".to_string(),
+                input_digest: "digest".to_string(),
+                attempt: None,
+                worker_id: None,
+                error: ErrorInfo {
+                    error_type: "ValueError".to_string(),
+                    message: "a bug".to_string(),
+                    failure_class: FailureClass::EvalException,
+                    stack: None,
+                    retryable: None,
+                },
+            })
+            .expect("mark failed");
+        assert!(matches!(
+            store.begin(begin_req()).expect("after eval_exception"),
+            Outcome::FailedTerminal { .. }
+        ));
+    }
+
+    #[test]
+    fn transient_failure_retries_under_default_policy() {
+        // With no explicit `retryable`, a transient class defers to the policy, which
+        // retries it.
+        let store = store();
+        store.begin(begin_req()).expect("begin");
+        store
+            .fail(FailRequest {
+                run_id: "run".to_string(),
+                kind: "step".to_string(),
+                input_digest: "digest".to_string(),
+                attempt: None,
+                worker_id: None,
+                error: ErrorInfo {
+                    error_type: "RuntimeError".to_string(),
+                    message: "blip".to_string(),
+                    failure_class: FailureClass::Transient,
+                    stack: None,
+                    retryable: None,
+                },
+            })
+            .expect("mark failed");
+        assert!(matches!(
+            store.begin(begin_req()).expect("retry transient"),
+            Outcome::Execute { attempt: 2 }
+        ));
+    }
+
+    #[test]
     fn failed_task_retries_on_next_begin() {
         let store = store();
         store.begin(begin_req()).expect("begin");

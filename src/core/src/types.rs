@@ -179,11 +179,10 @@ fn default_max_attempts() -> u32 {
 }
 
 fn default_retryable_classes() -> Vec<FailureClass> {
-    vec![
-        FailureClass::Transient,
-        FailureClass::ResourceUnavailable,
-        FailureClass::EvalException,
-    ]
+    // A plain exception from user code (EvalException) is treated as a deterministic
+    // bug and left terminal by default, so a failing task is not re-run. Only classes a
+    // client explicitly marks retryable retry (transient and resource-unavailable errors retry by default).
+    vec![FailureClass::Transient, FailureClass::ResourceUnavailable]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,10 +193,12 @@ pub enum FailureClass {
     /// A dependency is temporarily down or exhausted (store unreachable, quota hit,
     /// filesystem unavailable). Retry later.
     ResourceUnavailable,
-    /// An exception raised inside the user's eval/step callback.
+    /// An exception raised inside the user's eval/step callback. Treated as a
+    /// deterministic bug and not retried by default; raise a transient error
+    /// (or add `EvalException` to the retry policy) to opt a task into retries.
     EvalException,
     /// A failure in the durable-evals harness itself (runtime/server, serialization,
-    /// orchestration). Not the eval's fault; terminal by default.
+    /// orchestration). Not the eval's fault. It is terminal by default.
     DurableHarnessError,
     /// A deterministic artifact failure such as a hash mismatch or corrupt content.
     /// Transient storage outages should be reported as `ResourceUnavailable` instead.
