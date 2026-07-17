@@ -77,8 +77,8 @@ async fn run_cmd(args: Vec<String>) -> anyhow::Result<()> {
         let _ = axum::serve(listener, router(runtime)).await;
     });
 
-    let (program, mut cmd_args) = interpreter_for(&harness)?;
-    cmd_args.push(harness);
+    let program = env::var("DURABLE_EVALS_PYTHON").unwrap_or_else(|_| "python".into());
+    let mut cmd_args = vec![harness];
     cmd_args.extend(passthrough);
     let status = tokio::process::Command::new(program)
         .args(&cmd_args)
@@ -87,26 +87,6 @@ async fn run_cmd(args: Vec<String>) -> anyhow::Result<()> {
         .status()
         .await?;
     std::process::exit(status.code().unwrap_or(1));
-}
-
-/// Pick the interpreter for a harness by file extension. Python and JS run directly;
-/// TypeScript is run through the `tsx` loader, which must be installed.
-fn interpreter_for(harness: &str) -> anyhow::Result<(String, Vec<String>)> {
-    let ext = std::path::Path::new(harness)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    match ext {
-        "py" => Ok((
-            env::var("DURABLE_EVALS_PYTHON").unwrap_or_else(|_| "python".into()),
-            vec![],
-        )),
-        "js" | "mjs" | "cjs" => Ok(("node".into(), vec![])),
-        "ts" | "mts" => Ok(("node".into(), vec!["--import".into(), "tsx".into()])),
-        _ => Err(anyhow::anyhow!(
-            "don't know how to run `{harness}` (expected a .py, .js, or .ts harness)"
-        )),
-    }
 }
 
 fn router(runtime: Runtime) -> Router {
