@@ -9,6 +9,8 @@ import json
 import time
 from typing import Any, Callable, TypeVar
 
+from .errors import error_info
+
 F = TypeVar("F", bound=Callable[..., Any])
 BeginResult = tuple[str, str] | tuple[str, Any] | tuple[str, str, str, int]
 
@@ -133,12 +135,7 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
                 "input_digest": input_digest,
                 "attempt": attempt,
                 "worker_id": getattr(self, "worker_id", None),
-                "error": {
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
-                    "failure_class": "eval_exception",
-                    "retryable": True,
-                },
+                "error": error_info(exc),
             }
         )
 
@@ -152,12 +149,7 @@ def step(fn: F | None = None, *, name: str | None = None, retry: dict[str, Any] 
                 "input_digest": input_digest,
                 "attempt": attempt,
                 "worker_id": getattr(self, "worker_id", None),
-                "error": {
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
-                    "failure_class": "eval_exception",
-                    "retryable": True,
-                },
+                "error": error_info(exc),
             }
         )
 

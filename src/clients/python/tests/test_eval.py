@@ -2,7 +2,13 @@ import asyncio
 
 import pytest
 
-from durable_evals import DurableEval
+from durable_evals import (
+    DurableEval,
+    TransientError,
+    durable_reset,
+    durable_setup,
+    durable_teardown,
+)
 from durable_evals.eval import _json_digest
 
 
@@ -245,6 +251,167 @@ def test_dataset_records_callback_failures_and_continues():
     assert runtime.failed[0]["input_digest"] == _json_digest({"id": "task"})
     # fail() no longer carries max_attempts; the retry policy is passed at begin().
     assert "max_attempts" not in runtime.failed[0]
+
+
+def test_transient_error_is_classified_retryable():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+
+    eval_run.dataset("tasks", [{"id": "task"}]).map(
+        run=lambda _task: (_ for _ in ()).throw(TransientError("blip")),
+        max_attempts=1,
+    )
+
+    error = runtime.failed[0]["error"]
+    assert error["failure_class"] == "transient"
+    assert error["retryable"] is True
+
+
+def test_plain_exception_defers_retryable_to_policy():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+
+    eval_run.dataset("tasks", [{"id": "task"}]).map(
+        run=lambda _task: (_ for _ in ()).throw(ValueError("bug")),
+        max_attempts=1,
+    )
+
+    error = runtime.failed[0]["error"]
+    assert error["failure_class"] == "eval_exception"
+    # Retryability is left to the runtime's retry policy (eval_exception is terminal
+    # by default) rather than forced True by the client.
+    assert "retryable" not in error
+
+
+def test_classify_hook_overrides_failure_class():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+
+    eval_run.dataset("tasks", [{"id": "task"}]).map(
+        run=lambda _task: (_ for _ in ()).throw(RuntimeError("429")),
+        classify=lambda exc: "transient" if "429" in str(exc) else None,
+        max_attempts=1,
+    )
+
+    assert runtime.failed[0]["error"]["failure_class"] == "transient"
+
+
+def test_task_context_idempotency_key_is_stable_across_attempts_and_unique_per_task():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+    keys = []
+
+    def run(task, ctx):
+        keys.append((task["id"], ctx.idempotency_key))
+        if task["id"] == "a" and ctx.attempt == 1:
+            raise TransientError("retry once")
+        return ctx.idempotency_key
+
+    eval_run.dataset("tasks", [{"id": "a"}, {"id": "b"}]).map(run=run, max_attempts=3)
+
+    a_keys = [key for name, key in keys if name == "a"]
+    b_keys = [key for name, key in keys if name == "b"]
+    # Two attempts for "a", both with the same key; distinct from "b".
+    assert len(a_keys) == 2 and len(set(a_keys)) == 1
+    assert a_keys[0] != b_keys[0]
+
+
+def test_ctx_run_memoizes_calls_across_attempts():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+    calls = []
+
+    def expensive():
+        calls.append(1)
+        return {"answer": 42}
+
+    def run(task, ctx):
+        value = ctx.run(expensive)
+        if ctx.attempt == 1:
+            raise TransientError("crash after the expensive call")
+        return value
+
+    results = eval_run.dataset("tasks", [{"id": "task"}]).map(run=run, max_attempts=3)
+
+    # The expensive call ran once on attempt 1 and was replayed from storage on attempt 2.
+    assert results == [{"answer": 42}]
+    assert len(calls) == 1
+
+
+def test_lifecycle_hooks_bracket_each_attempt():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+    events = []
+
+    def run(task, ctx):
+        events.append(("run", ctx.attempt))
+        if ctx.attempt == 1:
+            raise TransientError("fail first attempt")
+        return "ok"
+
+    eval_run.dataset("tasks", [{"id": "task"}]).map(
+        run=run,
+        setup=lambda task, ctx: events.append(("setup", ctx.attempt)),
+        reset=lambda task, ctx: events.append(("reset", ctx.attempt)),
+        teardown=lambda task, ctx: events.append(("teardown", ctx.attempt)),
+        max_attempts=3,
+    )
+
+    assert events == [
+        ("setup", 1),
+        ("run", 1),
+        ("reset", 1),
+        ("teardown", 1),
+        ("setup", 2),
+        ("run", 2),
+        ("teardown", 2),
+    ]
+
+
+def test_durable_lifecycle_decorators_are_used_by_map():
+    runtime = Runtime()
+    events = []
+
+    class MyEval(DurableEval):
+        @durable_setup
+        def provision(self, task, ctx):
+            events.append("setup")
+
+        @durable_reset
+        def rollback(self, task, ctx):
+            events.append("reset")
+
+        @durable_teardown
+        def release(self, task, ctx):
+            events.append("teardown")
+
+    eval_run = MyEval(run_id="run", runtime=runtime)
+    eval_run.dataset("tasks", [{"id": "task"}]).map(run=lambda task, ctx: "ok")
+
+    # A clean run brackets the single attempt with setup + teardown and skips reset.
+    assert events == ["setup", "teardown"]
+
+
+def test_amap_classifies_and_brackets_with_async_hooks():
+    runtime = Runtime()
+    eval_run = DurableEval(run_id="run", runtime=runtime)
+    events = []
+
+    async def run(task, ctx):
+        events.append(("run", ctx.attempt))
+        raise TransientError("boom")
+
+    async def teardown(task, ctx):
+        events.append(("teardown", ctx.attempt))
+
+    asyncio.run(
+        eval_run.dataset("tasks", [{"id": "task"}]).amap(
+            run=run, teardown=teardown, max_attempts=1
+        )
+    )
+
+    assert runtime.failed[0]["error"]["failure_class"] == "transient"
+    assert events == [("run", 1), ("teardown", 1)]
 
 
 def test_dataset_map_assigns_category_and_filters_by_categories():
