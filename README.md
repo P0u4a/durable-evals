@@ -30,13 +30,11 @@ Write your eval as a normal script (a "harness") using the SDK, then run it with
 ```
 durable-eval run harness.py        # runs your eval, manages the runtime, resumes on rerun
 durable-eval run harness.py --fresh # ignore the cache and start over
-durable-eval run harness.ts -- --only math   # args after the harness are forwarded to it
+durable-eval run harness.py -- --only math   # args after the harness are forwarded to it
 ```
 
 `durable-eval run` starts the runtime, points your harness's client at it, streams its
 output, and exits with its status. Re-running resumes from where the last run left off.
-Harness language is detected by extension (`.py` → Python, `.js`/`.mjs` → Node,
-`.ts` → Node via `tsx`).
 
 ## Python
 
@@ -72,19 +70,79 @@ results = eval_run.dataset("infer_tasks", tasks).map(
 )
 ```
 
-Wrap individual model calls in `memo` for sub-task recovery: a crashed multi-turn
-task replays its earlier calls from storage instead of re-paying for them.
+### The task context
+
+If your `run` callback takes a second argument, it receives a `TaskContext` (`ctx`)
+that makes durability cheap to opt into without restructuring your task:
 
 ```python
-def run_task(task):
+def run_task(task, ctx):
     messages = [{"role": "user", "content": task["prompt"]}]
     for turn in range(10):
-        response = eval_run.memo(
-            {"task": task, "turn": turn, "messages": messages},
-            lambda: call_model(messages),
-        )
+        # ctx.run memoizes each call by its order in the task, so a crashed multi-turn
+        # task replays its earlier calls from storage instead of re-paying for them.
+        response = ctx.run(call_model, messages)
         messages = advance(messages, response)
-    return messages
+    return {"key": ctx.idempotency_key, "messages": messages}
+```
+
+`ctx.idempotency_key` is a stable key for the task, **identical across every retry**
+and unique per task. Tag external side effects with it — a container name, an output
+path, an API idempotency header — so a retried attempt deduplicates instead of
+duplicating work. Derive per-resource sub-keys with `ctx.key("container")`.
+
+`ctx.run(fn, *args)` (and `ctx.arun` for awaitables) is the non-invasive form of
+`eval_run.memo(key, fn)`: swap `call_model(x)` for `ctx.run(call_model, x)` and each
+call becomes durable, keyed by its position in the task. `ctx.trace` gives a trace
+handle already scoped to the task.
+
+### Environment lifecycle
+
+Provision and clean up a task's environment with lifecycle hooks. `setup` runs before
+each attempt, `reset` runs after a failed attempt (to roll back partial side effects),
+and `teardown` runs once the attempt resolves (to release what `setup` acquired). Pass
+them to `map`, or register them on a `DurableEval` subclass with decorators:
+
+```python
+from durable_evals import durable_setup, durable_reset, durable_teardown
+
+class MyEval(DurableEval):
+    @durable_setup
+    def provision(self, task, ctx):
+        start_container(name=ctx.idempotency_key)  # idempotent: reused across retries
+
+    @durable_reset
+    def rollback(self, task, ctx):
+        discard_partial_writes(ctx.idempotency_key)
+
+    @durable_teardown
+    def release(self, task, ctx):
+        stop_container(name=ctx.idempotency_key)
+```
+
+### Failure classification
+
+A failed attempt is retried only if its failure class is retryable under the retry
+policy. A plain exception is classified `eval_exception` and is **terminal by
+default**. A deterministic bug is not re-run.
+
+
+Signal a retryable failure by raising a typed error, or classify errors with a hook:
+
+```python
+from durable_evals import TransientError, ResourceUnavailableError
+
+def run_task(task, ctx):
+    try:
+        return call_model(task["prompt"])
+    except RateLimitError as exc:
+        raise TransientError(str(exc))  # retried per the policy
+
+results = eval_run.dataset("infer_tasks", tasks).map(
+    run=run_task,
+    classify=lambda exc: "transient" if isinstance(exc, IOError) else None,
+    retry={"max_attempts": 5, "retryable": ["transient", "resource_unavailable"]},
+)
 ```
 
 Durable steps are useful for shared setup, scoring, and aggregation:
@@ -125,77 +183,6 @@ task_events = eval_run.list_traces(task=task)             # one task by id
 model_calls = eval_run.list_traces(
     kind="browser_tasks", event_type=["model_request", "model_response"]
 )
-```
-
-## TypeScript
-
-```ts
-import { DurableEval } from "durable-evals";
-
-const evalRun = new DurableEval({
-  runId: "bfcl-simple",
-  name: "BFCL simple",
-  config: { model: "gpt-5.5" },
-});
-
-const tasks = [{ id: "task-1", prompt: "hello", category: "greeting" }];
-
-const results = await evalRun.dataset("inferTasks", tasks).map({
-  id: (task) => task.id, // optional label
-  category: (task) => task.category, // optional category
-  categories: ["greeting"], // optional: only run these categories
-  run: async (task) => ({ taskId: task.id, answer: "ok" }),
-  concurrency: 4,
-});
-
-console.log(await evalRun.summary());
-```
-
-Memoize individual model calls for sub-task recovery:
-
-```ts
-const response = await evalRun.memo({ task, turn, messages }, () =>
-  callModel(messages),
-);
-```
-
-Durable steps:
-
-```ts
-const prepareData = evalRun.step("prepareData", async () => [{ id: "task-1" }]);
-
-const score = evalRun.step(
-  "score",
-  async (results: unknown[]) => ({ total: results.length }),
-  {
-    retry: {
-      max_attempts: 3,
-      retryable: ["transient", "resource_unavailable"],
-    },
-  },
-);
-```
-
-Trace a multi-turn task:
-
-```ts
-const trace = evalRun.traceTask("browserTasks", { task });
-await trace.modelRequest({ messages: [] });
-await trace.toolCall({ name: "browser.click" });
-await trace.toolResult({ ok: true });
-await trace.terminationEvent({ reason: "done" });
-```
-
-Read traces back. `listTraces` returns every trace event for the run by default. You can filter by any combination of `kind`, `task`/`taskId`,
-`eventType` (a single type or a list), and `attempt`:
-
-```ts
-const allEvents = await evalRun.listTraces(); // every event for the run
-const taskEvents = await evalRun.listTraces({ task }); // one task by id
-const modelCalls = await evalRun.listTraces({
-  kind: "browserTasks",
-  eventType: ["model_request", "model_response"],
-});
 ```
 
 ## Runtime
